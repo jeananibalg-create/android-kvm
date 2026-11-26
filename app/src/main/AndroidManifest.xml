@@ -27,7 +27,10 @@
         <activity
             android:name=".PointerCaptureActivity"
             android:exported="false"
-            android:launchMode="singleTop"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
             android:theme="@style/Theme.TransparentCapture" />
 
         <service

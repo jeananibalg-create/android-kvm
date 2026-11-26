@@ -5,13 +5,11 @@ import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.TextView
 
 class PointerCaptureActivity : Activity() {
     private lateinit var captureView: View
@@ -22,28 +20,25 @@ class PointerCaptureActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         KvmState.captureActivity = this
+        KvmState.isRemoteActive = true
 
+        setShowWhenLocked(true)
+
+        // Sem FLAG_KEEP_SCREEN_ON para a tela apagar normalmente
         window.addFlags(
-            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         )
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
         window.setDimAmount(0f)
 
+        // Totalmente transparente e limpo, sem textos no topo
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(1, 0, 0, 0))
+            setBackgroundColor(Color.TRANSPARENT)
         }
-
-        val hint = TextView(this).apply {
-            text = "Cursor no Escravo  |  Dir. Rápido = Voltar  |  Segurar Dir. = Opções"
-            textSize = 11f
-            setTextColor(Color.argb(160, 255, 255, 255))
-            setPadding(24, 64, 24, 16)
-        }
-        root.addView(hint, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
         captureView = object : View(this) {
             override fun onCapturedPointerEvent(event: MotionEvent): Boolean {
@@ -83,7 +78,7 @@ class PointerCaptureActivity : Activity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             releaseAndClose()
             return true
         }
@@ -144,6 +139,7 @@ class PointerCaptureActivity : Activity() {
         runOnUiThread {
             try { captureView.releasePointerCapture() } catch (_: Exception) {}
             KvmState.captureActivity = null
+            KvmState.isRemoteActive = false
             KvmState.activePeer = null
             KvmState.activeEdge = null
             finish()
@@ -154,6 +150,7 @@ class PointerCaptureActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         KvmState.captureActivity = null
+        KvmState.isRemoteActive = false
         super.onDestroy()
     }
 }

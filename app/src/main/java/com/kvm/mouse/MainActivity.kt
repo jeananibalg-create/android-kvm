@@ -34,7 +34,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v2.1 (Zero-Latency)"
+            text = "Android KVM v2.2"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -94,13 +94,13 @@ class MainActivity : AppCompatActivity() {
         root.addView(speedBar)
 
         val btnShizuku = Button(this).apply {
-            text = "1. Autorizar Shizuku (Obrigatório no Escravo)"
+            text = "1. Autorizar Shizuku (Mestre e Escravo)"
             setOnClickListener { requestShizukuPerm() }
         }
         root.addView(btnShizuku)
 
         val btnOverlay = Button(this).apply {
-            text = "2. Permitir Sobrepor Apps (Obrigatório em ambos)"
+            text = "2. Permitir Sobrepor Apps (Mestre e Escravo)"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))

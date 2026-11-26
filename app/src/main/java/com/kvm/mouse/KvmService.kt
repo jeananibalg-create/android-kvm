@@ -1,5 +1,6 @@
 package com.kvm.mouse
 
+import android.app.KeyguardManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -13,7 +14,9 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -29,6 +32,8 @@ import kotlin.concurrent.thread
 
 class KvmService : Service() {
     private lateinit var wm: WindowManager
+    private lateinit var powerManager: PowerManager
+    private lateinit var keyguardManager: KeyguardManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val edgeViews = mutableListOf<View>()
@@ -37,6 +42,8 @@ class KvmService : Service() {
 
     private var curX = 300f
     private var curY = 600f
+    private var virtualMasterX = 500f
+    private var virtualMasterY = 1000f
     private var entryEdge: Edge? = null
     private var masterAddress: InetAddress? = null
 
@@ -47,11 +54,73 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(3)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(4)
+
+    private val hwCallback = object : IMouseEventCallback.Stub() {
+        override fun onMouseDelta(dx: Float, dy: Float) {
+            if (!KvmState.isMasterMode) return
+            val isLockedOrOff = !powerManager.isInteractive || keyguardManager.isKeyguardLocked
+            // Quando a tela está apagada ou bloqueada com senha/digital, assume controle direto via hardware
+            if (isLockedOrOff) {
+                val (w, h) = getFullScreenBounds()
+                if (!KvmState.isRemoteActive) {
+                    virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
+                    virtualMasterY = (virtualMasterY + dy).coerceIn(0f, h)
+
+                    val crossedEdge = when {
+                        virtualMasterX >= w - 2f && KvmState.edgeAssignments[Edge.RIGHT] != null -> Edge.RIGHT
+                        virtualMasterX <= 2f && KvmState.edgeAssignments[Edge.LEFT] != null -> Edge.LEFT
+                        virtualMasterY <= 2f && KvmState.edgeAssignments[Edge.TOP] != null -> Edge.TOP
+                        virtualMasterY >= h - 2f && KvmState.edgeAssignments[Edge.BOTTOM] != null -> Edge.BOTTOM
+                        else -> null
+                    }
+                    if (crossedEdge != null) {
+                        val peer = KvmState.edgeAssignments[crossedEdge] ?: return
+                        val ratio = when (crossedEdge) {
+                            Edge.LEFT, Edge.RIGHT -> (virtualMasterY / h).coerceIn(0f, 1f)
+                            Edge.TOP, Edge.BOTTOM -> (virtualMasterX / w).coerceIn(0f, 1f)
+                        }
+                        KvmState.activeEdge = crossedEdge
+                        KvmState.activePeer = peer
+                        KvmState.isRemoteActive = true
+                        UdpFastSender.sendEnter(peer, crossedEdge, ratio)
+                    }
+                } else {
+                    val peer = KvmState.activePeer ?: return
+                    UdpFastSender.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
+                }
+            }
+        }
+
+        override fun onMouseButton(action: Int, button: Int) {
+            if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
+            val isLockedOrOff = !powerManager.isInteractive || keyguardManager.isKeyguardLocked
+            if (isLockedOrOff && KvmState.captureActivity == null) {
+                val peer = KvmState.activePeer ?: return
+                if (button == MotionEvent.BUTTON_TERTIARY && action == MotionEvent.ACTION_DOWN) {
+                    UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
+                } else {
+                    UdpFastSender.sendButton(peer, action, button)
+                }
+            }
+        }
+
+        override fun onMouseScroll(vScroll: Float) {
+            if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
+            val isLockedOrOff = !powerManager.isInteractive || keyguardManager.isKeyguardLocked
+            if (isLockedOrOff && KvmState.captureActivity == null) {
+                val peer = KvmState.activePeer ?: return
+                UdpFastSender.sendScroll(peer, vScroll, 0f)
+            }
+        }
+    }
 
     private val shizukuConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             injector = IInputInjector.Stub.asInterface(service)
+            if (KvmState.isMasterMode) {
+                try { injector?.startHardwareMouseMonitor(hwCallback) } catch (_: Exception) {}
+            }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             injector = null
@@ -77,6 +146,9 @@ class KvmService : Service() {
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("kvm_lock").apply {
             setReferenceCounted(true)
@@ -85,12 +157,12 @@ class KvmService : Service() {
 
         startForegroundNotification()
         startFastUdpReceiver()
+        bindShizuku()
 
         if (KvmState.isMasterMode) {
             setupMasterEdgeTriggers()
             startDiscoveryLoop()
         } else {
-            bindShizuku()
             setupSlaveCursorOverlay()
             startBeaconLoop()
         }
@@ -108,7 +180,7 @@ class KvmService : Service() {
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v2.1 Ativo")
+            .setContentTitle("Android KVM v2.2 Ativo")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
@@ -150,7 +222,7 @@ class KvmService : Service() {
             view.setOnHoverListener { _, event ->
                 if (event.action == MotionEvent.ACTION_HOVER_ENTER) {
                     val targetPeer = KvmState.edgeAssignments[edge]
-                    if (targetPeer != null && KvmState.captureActivity == null) {
+                    if (targetPeer != null && KvmState.captureActivity == null && !KvmState.isRemoteActive) {
                         val (w, h) = getFullScreenBounds()
                         val normRatio = when (edge) {
                             Edge.LEFT, Edge.RIGHT -> (event.rawY / h).coerceIn(0f, 1f)
@@ -158,10 +230,15 @@ class KvmService : Service() {
                         }
                         KvmState.activeEdge = edge
                         KvmState.activePeer = targetPeer
+                        KvmState.isRemoteActive = true
                         UdpFastSender.sendEnter(targetPeer, edge, normRatio)
 
                         val intent = Intent(this, PointerCaptureActivity::class.java).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                            addFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                                Intent.FLAG_ACTIVITY_NO_USER_ACTION
+                            )
                         }
                         startActivity(intent)
                     }
@@ -341,6 +418,15 @@ class KvmService : Service() {
                 }
             }
             KvmState.PKT_RETURN -> {
+                val (w, h) = getFullScreenBounds()
+                when (KvmState.activeEdge) {
+                    Edge.RIGHT -> virtualMasterX = w - 30f
+                    Edge.LEFT -> virtualMasterX = 30f
+                    Edge.TOP -> virtualMasterY = 30f
+                    Edge.BOTTOM -> virtualMasterY = h - 30f
+                    null -> {}
+                }
+                KvmState.isRemoteActive = false
                 KvmState.captureActivity?.releaseAndClose()
             }
         }
@@ -366,6 +452,7 @@ class KvmService : Service() {
         try { multicastLock?.release() } catch (_: Exception) {}
         edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
         cursorView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        try { injector?.stopHardwareMouseMonitor() } catch (_: Exception) {}
         try { Shizuku.unbindUserService(userServiceArgs, shizukuConnection, true) } catch (_: Exception) {}
         super.onDestroy()
     }

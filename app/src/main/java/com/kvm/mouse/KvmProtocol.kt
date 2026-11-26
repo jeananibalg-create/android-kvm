@@ -45,6 +45,7 @@ object KvmState {
     @Volatile var activeEdge: Edge? = null
     @Volatile var activePeer: PeerDevice? = null
     @Volatile var captureActivity: PointerCaptureActivity? = null
+    @Volatile var isRemoteActive = false
 }
 
 object UdpFastSender {

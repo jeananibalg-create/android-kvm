@@ -8,6 +8,11 @@ import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import java.io.File
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
 class InputInjectorService : IInputInjector.Stub() {
@@ -30,14 +35,93 @@ class InputInjectorService : IInputInjector.Stub() {
     private var lastX = 0f
     private var lastY = 0f
 
+    @Volatile private var monitoringHardware = false
+    private var hwCallback: IMouseEventCallback? = null
+
     private val rightLongPressRunnable = Runnable {
         if (isRightPressed) {
             rightLongPressTriggered = true
             val now = SystemClock.uptimeMillis()
             downTime = now
-            // Injeta toque longo nativo na coordenada exata para abrir menu/opções do atalho na One UI
             dispatchTouch(downTime, now, MotionEvent.ACTION_DOWN, lastX, lastY, 1.0f)
         }
+    }
+
+    override fun startHardwareMouseMonitor(callback: IMouseEventCallback?) {
+        hwCallback = callback
+        if (monitoringHardware) return
+        monitoringHardware = true
+
+        thread(isDaemon = true, name = "EvdevMouseMonitor") {
+            val inputDir = File("/dev/input")
+            val files = inputDir.listFiles { f -> f.name.startsWith("event") } ?: emptyArray()
+            files.forEach { evFile ->
+                thread(isDaemon = true, name = "Evdev_${evFile.name}") {
+                    readEvdevLoop(evFile)
+                }
+            }
+        }
+    }
+
+    private fun readEvdevLoop(file: File) {
+        try {
+            FileInputStream(file).use { fis ->
+                val buf = ByteArray(24)
+                val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+                var accX = 0f
+                var accY = 0f
+
+                while (monitoringHardware) {
+                    val read = fis.read(buf)
+                    if (read < 24) break
+                    bb.rewind()
+                    bb.long // tv_sec
+                    bb.long // tv_usec
+                    val type = bb.short.toInt() and 0xFFFF
+                    val code = bb.short.toInt() and 0xFFFF
+                    val value = bb.int
+
+                    when (type) {
+                        0x02 -> { // EV_REL
+                            when (code) {
+                                0x00 -> accX += value.toFloat() // REL_X
+                                0x01 -> accY += value.toFloat() // REL_Y
+                                0x08 -> hwCallback?.onMouseScroll(value.toFloat()) // REL_WHEEL
+                            }
+                        }
+                        0x01 -> { // EV_KEY
+                            when (code) {
+                                0x110 -> hwCallback?.onMouseButton(
+                                    if (value == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_UP,
+                                    MotionEvent.BUTTON_PRIMARY
+                                )
+                                0x111 -> hwCallback?.onMouseButton(
+                                    if (value == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_UP,
+                                    MotionEvent.BUTTON_SECONDARY
+                                )
+                                0x112 -> hwCallback?.onMouseButton(
+                                    if (value == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_UP,
+                                    MotionEvent.BUTTON_TERTIARY
+                                )
+                            }
+                        }
+                        0x00 -> { // EV_SYN
+                            if (accX != 0f || accY != 0f) {
+                                hwCallback?.onMouseDelta(accX, accY)
+                                accX = 0f
+                                accY = 0f
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun stopHardwareMouseMonitor() {
+        monitoringHardware = false
+        hwCallback = null
     }
 
     override fun injectMove(x: Float, y: Float) {
@@ -45,15 +129,9 @@ class InputInjectorService : IInputInjector.Stub() {
         lastY = y
         val now = SystemClock.uptimeMillis()
         when {
-            isLeftPressed -> {
-                dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
-            }
-            rightLongPressTriggered -> {
-                dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
-            }
-            else -> {
-                dispatchMouseHover(now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0f, 0f)
-            }
+            isLeftPressed -> dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
+            rightLongPressTriggered -> dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
+            else -> dispatchMouseHover(now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0f, 0f)
         }
     }
 
@@ -67,17 +145,14 @@ class InputInjectorService : IInputInjector.Stub() {
                 isRightPressed = true
                 rightLongPressTriggered = false
                 handler.removeCallbacks(rightLongPressRunnable)
-                // Se segurar o botão direito por 320ms, abre o menu do atalho/ícone
                 handler.postDelayed(rightLongPressRunnable, 320)
             } else if (action == MotionEvent.ACTION_UP) {
                 handler.removeCallbacks(rightLongPressRunnable)
                 if (rightLongPressTriggered) {
-                    // Solta o toque longo do menu de contexto
                     val dTime = if (downTime > 0L) downTime else now
                     dispatchTouch(dTime, now, MotionEvent.ACTION_UP, x, y, 0.0f)
                     downTime = 0L
                 } else if (isRightPressed) {
-                    // Clique rápido com o botão direito = Voltar
                     injectKey(KeyEvent.KEYCODE_BACK)
                 }
                 isRightPressed = false
@@ -86,7 +161,6 @@ class InputInjectorService : IInputInjector.Stub() {
             return
         }
 
-        // Botão Esquerdo: emula toque capacitivo direto para abrir apps, links e gestos sem falhar na One UI
         if (action == MotionEvent.ACTION_DOWN) {
             downTime = now
             isLeftPressed = true
@@ -179,6 +253,7 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     override fun destroy() {
+        monitoringHardware = false
         handler.removeCallbacksAndMessages(null)
         exitProcess(0)
     }
