@@ -63,25 +63,16 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(9)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(10)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> {
-                    KvmState.captureActivity?.releaseCaptureWindowOnly()
-                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
-                        acquireCpuOnlyWakeLock()
-                    }
-                }
-                Intent.ACTION_SCREEN_ON -> {
-                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
-                        mainHandler.postDelayed({
-                            if (KvmState.isRemoteActive) {
-                                try { injector?.setScreenPower(false) } catch (_: Exception) {}
-                            }
-                        }, 40)
-                    }
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+                KvmState.captureActivity?.releaseCaptureWindowOnly()
+                if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                    // Agarra exclusivamente o mouse no kernel para o Bluetooth nao acordar a tela nem dar toques fantasmas
+                    try { injector?.setMouseGrabbed(true) } catch (_: Exception) {}
+                    acquireCpuOnlyWakeLock()
                 }
             }
         }
@@ -139,6 +130,7 @@ class KvmService : Service() {
                         KvmState.activePeer = peer
                         KvmState.isRemoteActive = true
                         KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
+                        try { injector?.setMouseGrabbed(true) } catch (_: Exception) {}
                         acquireCpuOnlyWakeLock()
                         UdpFastSender.sendEnter(peer, crossedEdge, ratio)
                     }
@@ -170,7 +162,12 @@ class KvmService : Service() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             injector = IInputInjector.Stub.asInterface(service)
             if (KvmState.isMasterMode) {
-                try { injector?.startHardwareMouseMonitor(hwCallback) } catch (_: Exception) {}
+                try {
+                    injector?.startHardwareMouseMonitor(hwCallback)
+                    if (KvmState.isRemoteActive) {
+                        injector?.setMouseGrabbed(true)
+                    }
+                } catch (_: Exception) {}
             } else {
                 try { injector?.createVirtualMouse() } catch (_: Exception) {}
             }
@@ -203,11 +200,7 @@ class KvmService : Service() {
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_SCREEN_ON)
-        }
-        registerReceiver(screenReceiver, filter)
+        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
 
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("kvm_lock").apply {
@@ -228,7 +221,6 @@ class KvmService : Service() {
         }
     }
 
-    // Watchdog de recuperacao de falhas: reconecta Shizuku e libera cursor preso se o Wi-Fi cair
     private fun startWatchdogLoop() {
         thread(isDaemon = true, name = "KvmWatchdog") {
             while (running) {
@@ -242,14 +234,13 @@ class KvmService : Service() {
                         if (peer != null) {
                             UdpFastSender.sendPing(peer)
                         }
-                        // Se o Escravo ficar >1.4s sem responder ao ping, devolve controle para nunca travar
                         if (KvmState.lastHeartbeatMs > 0L && (now - KvmState.lastHeartbeatMs) > 1400L) {
                             KvmState.isRemoteActive = false
+                            try { injector?.setMouseGrabbed(false) } catch (_: Exception) {}
                             releaseCpuWakeLock()
                             KvmState.captureActivity?.releaseAndClose()
                         }
                     } else if (!KvmState.isMasterMode) {
-                        // Se o Mestre parar de enviar sinais por >1.6s, remove o mouse virtual da tela escrava
                         if (lastSlaveTrafficMs > 0L && (now - lastSlaveTrafficMs) > 1600L) {
                             lastSlaveTrafficMs = 0L
                             try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
@@ -297,7 +288,7 @@ class KvmService : Service() {
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v3.1 (HID + Watchdog)")
+            .setContentTitle("Android KVM v3.2 (EVIOCGRAB + HID)")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
@@ -361,6 +352,7 @@ class KvmService : Service() {
                             }
                             startActivity(intent)
                         } else {
+                            try { injector?.setMouseGrabbed(true) } catch (_: Exception) {}
                             acquireCpuOnlyWakeLock()
                         }
                     }
@@ -588,9 +580,12 @@ class KvmService : Service() {
                     null -> {}
                 }
                 KvmState.isRemoteActive = false
+                // Devolve o mouse fisico ao S25 Plus
+                try { injector?.setMouseGrabbed(false) } catch (_: Exception) {}
                 releaseCpuWakeLock()
                 KvmState.captureActivity?.releaseAndClose()
 
+                // Agora sim, como a seta voltou para o Mestre, acende a tela do Mestre
                 if (!powerManager.isInteractive) {
                     try { injector?.setScreenPower(true) } catch (_: Exception) {}
                 }
@@ -605,6 +600,7 @@ class KvmService : Service() {
         udpSocket?.close()
         try { multicastLock?.release() } catch (_: Exception) {}
         edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
+        try { injector?.setMouseGrabbed(false) } catch (_: Exception) {}
         try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
         try { injector?.stopHardwareMouseMonitor() } catch (_: Exception) {}
         try { Shizuku.unbindUserService(userServiceArgs, shizukuConnection, true) } catch (_: Exception) {}

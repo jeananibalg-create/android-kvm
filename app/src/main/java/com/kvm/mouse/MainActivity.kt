@@ -34,7 +34,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v3.1 (HID + Watchdog)"
+            text = "Android KVM v3.2 (EVIOCGRAB + HID)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }

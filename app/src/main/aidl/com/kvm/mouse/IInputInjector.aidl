@@ -11,6 +11,7 @@ interface IInputInjector {
     void sendVirtualMouseScroll(int wheel);
     void injectKey(int keyCode);
     void setScreenPower(boolean on);
+    void setMouseGrabbed(boolean grab);
     void startHardwareMouseMonitor(IMouseEventCallback callback);
     void stopHardwareMouseMonitor();
     void destroy();

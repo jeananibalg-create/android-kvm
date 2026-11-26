@@ -5,15 +5,19 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.system.Os
+import android.system.OsConstants
 import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.File
+import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
@@ -34,8 +38,9 @@ class InputInjectorService : IInputInjector.Stub() {
     private var currentButtonsMask = 0
 
     @Volatile private var monitoringHardware = false
+    @Volatile private var isGrabbed = false
     private var hwCallback: IMouseEventCallback? = null
-    private val activeReaders = mutableSetOf<String>()
+    private val openMouseFds = ConcurrentHashMap<String, FileDescriptor>()
 
     private val mouseHidDescriptor = byteArrayOf(
         0x05, 0x01,       // Usage Page (Generic Desktop)
@@ -67,6 +72,66 @@ class InputInjectorService : IInputInjector.Stub() {
         0xC0.toByte()        // End Collection
     )
 
+    // Verifica via /sys/class/input/eventX/device/capabilities se o dispositivo e EXCLUSIVAMENTE um mouse (tem rel X/Y e nao e touchscreen)
+    private fun isPhysicalMouseDevice(eventName: String): Boolean {
+        try {
+            val sysBase = File("/sys/class/input/$eventName/device")
+            val nameFile = File(sysBase, "name")
+            val devName = if (nameFile.exists()) nameFile.readText().trim().lowercase() else ""
+            // Ignora nosso proprio mouse virtual KVM e touchscreens/sensores
+            if (devName.contains("kvm") || devName.contains("touch") || devName.contains("sensor") || devName.contains("gpio")) {
+                return false
+            }
+
+            val relFile = File(sysBase, "capabilities/rel")
+            val absFile = File(sysBase, "capabilities/abs")
+            val keyFile = File(sysBase, "capabilities/key")
+            if (!relFile.exists() || !keyFile.exists()) return false
+
+            val relHex = relFile.readText().trim()
+            if (relHex.isEmpty() || relHex == "0") return false
+
+            // Bitmask de REL_X (bit 0 = 1) e REL_Y (bit 1 = 2) -> ultimos digitos hex terminam com 3, 7, b, f
+            val lastRelWord = relHex.split(" ").last().toLongOrNull(16) ?: 0L
+            val hasRelXY = (lastRelWord and 0x03L) == 0x03L
+            if (!hasRelXY) return false
+
+            // Garante que nao e um digitizer/touchscreen absoluto (ABS_MT_POSITION_X = bit 0x35)
+            val absHex = if (absFile.exists()) absFile.readText().trim() else "0"
+            if (absHex != "0" && absHex.isNotEmpty()) return false
+
+            return true
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    // Executa EVIOCGRAB (0x40044590) via reflection em Os.ioctlInt / Libcore para isolar o mouse do S25 Plus
+    private fun applyIoctlGrab(fd: FileDescriptor, grab: Boolean) {
+        val EVIOCGRAB = 0x40044590.toInt()
+        val arg = if (grab) 1 else 0
+        try {
+            val ioctlMethod = Os::class.java.getMethod("ioctlInt", FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            ioctlMethod.invoke(null, fd, EVIOCGRAB, arg)
+            return
+        } catch (_: Exception) {
+        }
+        try {
+            val libcoreClass = Class.forName("libcore.io.Libcore")
+            val osField = libcoreClass.getField("os").get(null)
+            val ioctlMethod = osField.javaClass.getMethod("ioctlInt", FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            ioctlMethod.invoke(osField, fd, EVIOCGRAB, arg)
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun setMouseGrabbed(grab: Boolean) {
+        isGrabbed = grab
+        openMouseFds.values.forEach { fd ->
+            applyIoctlGrab(fd, grab)
+        }
+    }
+
     @Synchronized
     override fun createVirtualMouse() {
         if (uhidOut != null) return
@@ -82,8 +147,8 @@ class InputInjectorService : IInputInjector.Stub() {
 
             buf.putShort(mouseHidDescriptor.size.toShort())
             buf.putShort(0x05) // BUS_BLUETOOTH
-            buf.putInt(0x04E8) // Samsung Vendor ID
-            buf.putInt(0x7021) // Samsung Bluetooth Mouse Product ID
+            buf.putInt(0x04E8)
+            buf.putInt(0x7021)
             buf.putInt(0x0100)
             buf.putInt(0)
             buf.put(mouseHidDescriptor)
@@ -101,7 +166,7 @@ class InputInjectorService : IInputInjector.Stub() {
     override fun destroyVirtualMouse() {
         val fos = uhidOut ?: return
         try {
-            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array() // UHID_DESTROY
+            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array()
             fos.write(buf)
             fos.flush()
             fos.close()
@@ -164,8 +229,8 @@ class InputInjectorService : IInputInjector.Stub() {
     private val rescanRunnable = object : Runnable {
         override fun run() {
             if (monitoringHardware) {
-                scanInputDevices()
-                handler.postDelayed(this, 2500)
+                scanMouseDevicesOnly()
+                handler.postDelayed(this, 3000)
             }
         }
     }
@@ -184,10 +249,6 @@ class InputInjectorService : IInputInjector.Stub() {
                 sleepMethod.invoke(pm, now)
             }
         } catch (_: Exception) {
-            try {
-                Runtime.getRuntime().exec(arrayOf("input", "keyevent", if (on) "224" else "223"))
-            } catch (_: Exception) {
-            }
         }
     }
 
@@ -195,31 +256,32 @@ class InputInjectorService : IInputInjector.Stub() {
         hwCallback = callback
         if (monitoringHardware) return
         monitoringHardware = true
-        scanInputDevices()
-        handler.postDelayed(rescanRunnable, 2500)
+        scanMouseDevicesOnly()
+        handler.postDelayed(rescanRunnable, 3000)
     }
 
-    private fun scanInputDevices() {
+    private fun scanMouseDevicesOnly() {
         val inputDir = File("/dev/input")
         val files = inputDir.listFiles { f -> f.name.startsWith("event") } ?: return
         files.forEach { evFile ->
-            synchronized(activeReaders) {
-                if (!activeReaders.contains(evFile.name)) {
-                    activeReaders.add(evFile.name)
-                    thread(isDaemon = true, name = "Evdev_${evFile.name}") {
-                        readEvdevLoop(evFile)
-                        synchronized(activeReaders) {
-                            activeReaders.remove(evFile.name)
-                        }
-                    }
+            if (!openMouseFds.containsKey(evFile.name) && isPhysicalMouseDevice(evFile.name)) {
+                thread(isDaemon = true, name = "MouseEvdev_${evFile.name}") {
+                    readMouseLoop(evFile)
                 }
             }
         }
     }
 
-    private fun readEvdevLoop(file: File) {
+    private fun readMouseLoop(file: File) {
+        var fd: FileDescriptor? = null
         try {
-            FileInputStream(file).use { fis ->
+            fd = Os.open(file.absolutePath, OsConstants.O_RDONLY, 0)
+            openMouseFds[file.name] = fd
+            if (isGrabbed) {
+                applyIoctlGrab(fd, true)
+            }
+
+            FileInputStream(fd).use { fis ->
                 val buf = ByteArray(24)
                 val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                 var accX = 0f
@@ -278,12 +340,24 @@ class InputInjectorService : IInputInjector.Stub() {
                 }
             }
         } catch (_: Exception) {
+        } finally {
+            openMouseFds.remove(file.name)
+            if (fd != null) {
+                try { applyIoctlGrab(fd, false) } catch (_: Exception) {}
+                try { Os.close(fd) } catch (_: Exception) {}
+            }
         }
     }
 
     override fun stopHardwareMouseMonitor() {
         monitoringHardware = false
+        isGrabbed = false
         handler.removeCallbacks(rescanRunnable)
+        openMouseFds.values.forEach { fd ->
+            try { applyIoctlGrab(fd, false) } catch (_: Exception) {}
+            try { Os.close(fd) } catch (_: Exception) {}
+        }
+        openMouseFds.clear()
         hwCallback = null
     }
 
@@ -299,7 +373,7 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     override fun destroy() {
-        monitoringHardware = false
+        stopHardwareMouseMonitor()
         destroyVirtualMouse()
         handler.removeCallbacksAndMessages(null)
         exitProcess(0)
