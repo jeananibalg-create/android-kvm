@@ -3,16 +3,14 @@ package com.kvm.mouse
 import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
-import android.system.Os
-import android.system.OsConstants
 import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.File
-import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -39,8 +37,9 @@ class InputInjectorService : IInputInjector.Stub() {
     private var currentButtonsMask = 0
 
     @Volatile private var monitoringHardware = false
+    @Volatile private var isGrabbed = false
     private var hwCallback: IMouseEventCallback? = null
-    private val openMouseFds = ConcurrentHashMap<String, FileDescriptor>()
+    private val openNativeFds = ConcurrentHashMap<String, Int>()
 
     private val mouseHidDescriptor = byteArrayOf(
         0x05, 0x01,       // Usage Page (Generic Desktop)
@@ -77,7 +76,7 @@ class InputInjectorService : IInputInjector.Stub() {
             val sysBase = File("/sys/class/input/$eventName/device")
             val nameFile = File(sysBase, "name")
             val devName = if (nameFile.exists()) nameFile.readText().trim().lowercase() else ""
-            if (devName.contains("kvm") || devName.contains("touch") || devName.contains("sensor") || devName.contains("gpio")) {
+            if (devName.contains("kvm") || devName.contains("multi control") || devName.contains("touch") || devName.contains("sensor") || devName.contains("gpio")) {
                 return false
             }
 
@@ -102,8 +101,18 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
-    // Emula as politicas do plugin Samsung Multi Control: coloca o pacote na whitelist do Doze
-    // e configura o comportamento de despertar por perifericos sem desabilitar o mouse
+    // Executa EVIOCGRAB real via C/JNI no kernel Linux:
+    // O mouse entrega eventos APENAS para nosso processo e NADA para o Android/One UI do Mestre!
+    override fun setKernelMouseGrab(grab: Boolean) {
+        isGrabbed = grab
+        openNativeFds.values.forEach { rawFd ->
+            try {
+                NativeEvdev.grabDevice(rawFd, grab)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     override fun applyMultiControlSystemPolicy(enableLockscreenMode: Boolean) {
         try {
             Runtime.getRuntime().exec(arrayOf("dumpsys", "deviceidle", "whitelist", "+com.kvm.mouse"))
@@ -249,8 +258,8 @@ class InputInjectorService : IInputInjector.Stub() {
         val inputDir = File("/dev/input")
         val files = inputDir.listFiles { f -> f.name.startsWith("event") } ?: return
         files.forEach { evFile ->
-            if (!openMouseFds.containsKey(evFile.name) && isPhysicalMouseDevice(evFile.name)) {
-                thread(isDaemon = true, name = "MouseEvdev_${evFile.name}") {
+            if (!openNativeFds.containsKey(evFile.name) && isPhysicalMouseDevice(evFile.name)) {
+                thread(isDaemon = true, name = "NativeMouse_${evFile.name}") {
                     readMouseLoop(evFile)
                 }
             }
@@ -258,12 +267,17 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     private fun readMouseLoop(file: File) {
-        var fd: FileDescriptor? = null
-        try {
-            fd = Os.open(file.absolutePath, OsConstants.O_RDONLY, 0)
-            openMouseFds[file.name] = fd
+        val rawFd = NativeEvdev.openDevice(file.absolutePath)
+        if (rawFd < 0) return
+        openNativeFds[file.name] = rawFd
+        if (isGrabbed) {
+            NativeEvdev.grabDevice(rawFd, true)
+        }
 
-            FileInputStream(fd).use { fis ->
+        var pfd: ParcelFileDescriptor? = null
+        try {
+            pfd = ParcelFileDescriptor.adoptFd(rawFd)
+            FileInputStream(pfd.fileDescriptor).use { fis ->
                 val buf = ByteArray(24)
                 val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                 var accX = 0f
@@ -323,20 +337,20 @@ class InputInjectorService : IInputInjector.Stub() {
             }
         } catch (_: Exception) {
         } finally {
-            openMouseFds.remove(file.name)
-            if (fd != null) {
-                try { Os.close(fd) } catch (_: Exception) {}
-            }
+            openNativeFds.remove(file.name)
+            try { NativeEvdev.grabDevice(rawFd, false) } catch (_: Exception) {}
+            try { pfd?.close() } catch (_: Exception) {}
         }
     }
 
     override fun stopHardwareMouseMonitor() {
         monitoringHardware = false
+        isGrabbed = false
         handler.removeCallbacks(rescanRunnable)
-        openMouseFds.values.forEach { fd ->
-            try { Os.close(fd) } catch (_: Exception) {}
+        openNativeFds.values.forEach { rawFd ->
+            try { NativeEvdev.closeDevice(rawFd) } catch (_: Exception) {}
         }
-        openMouseFds.clear()
+        openNativeFds.clear()
         hwCallback = null
     }
 

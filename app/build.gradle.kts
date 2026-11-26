@@ -11,8 +11,17 @@ android {
         applicationId = "com.kvm.mouse"
         minSdk = 30
         targetSdk = 34
-        versionCode = 15
-        versionName = "5.0"
+        versionCode = 16
+        versionName = "6.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     buildTypes {

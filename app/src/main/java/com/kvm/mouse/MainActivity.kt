@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(root)
 
         val title = TextView(this).apply {
-            text = "Android KVM v5.0 (Multi Control)"
+            text = "Android KVM v6.0 (Kernel C Grab)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
