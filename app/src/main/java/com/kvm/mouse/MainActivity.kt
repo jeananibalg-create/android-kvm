@@ -34,7 +34,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v3.0 (Mouse HID Nativo)"
+            text = "Android KVM v3.1 (HID + Watchdog)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }

@@ -34,6 +34,8 @@ object KvmState {
     const val PKT_KEY: Byte = 6
     const val PKT_DISCOVER: Byte = 7
     const val PKT_HELLO: Byte = 8
+    const val PKT_PING: Byte = 9
+    const val PKT_PONG: Byte = 10
 
     var isMasterMode = true
     var isRunning = false
@@ -46,6 +48,7 @@ object KvmState {
     @Volatile var activePeer: PeerDevice? = null
     @Volatile var captureActivity: PointerCaptureActivity? = null
     @Volatile var isRemoteActive = false
+    @Volatile var lastHeartbeatMs = 0L
 }
 
 object UdpFastSender {
@@ -96,6 +99,14 @@ object UdpFastSender {
     fun sendReturn(host: InetAddress) {
         val buf = byteArrayOf(KvmState.PKT_RETURN)
         queue.offer(OutPacket(buf, host, KvmState.UDP_PORT))
+    }
+
+    fun sendPing(peer: PeerDevice) {
+        queue.offer(OutPacket(byteArrayOf(KvmState.PKT_PING), peer.host, peer.port))
+    }
+
+    fun sendPong(host: InetAddress) {
+        queue.offer(OutPacket(byteArrayOf(KvmState.PKT_PONG), host, KvmState.UDP_PORT))
     }
 
     fun sendRaw(data: ByteArray, host: InetAddress, port: Int = KvmState.UDP_PORT) {

@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
@@ -42,7 +43,6 @@ class KvmService : Service() {
 
     private val edgeViews = mutableListOf<View>()
 
-    // Rastreamento relativo da posicao no Escravo (considerando tela do celular + monitor externo Samsung DeX)
     private var relX = 0f
     private var relY = 0f
     private var totalSlaveWidth = 1080f
@@ -53,6 +53,7 @@ class KvmService : Service() {
     private var virtualMasterY = 1000f
     private var entryEdge: Edge? = null
     private var masterAddress: InetAddress? = null
+    private var lastSlaveTrafficMs = 0L
 
     private var injector: IInputInjector? = null
     private var udpSocket: DatagramSocket? = null
@@ -62,7 +63,7 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(8)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(9)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -137,6 +138,7 @@ class KvmService : Service() {
                         KvmState.activeEdge = crossedEdge
                         KvmState.activePeer = peer
                         KvmState.isRemoteActive = true
+                        KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
                         acquireCpuOnlyWakeLock()
                         UdpFastSender.sendEnter(peer, crossedEdge, ratio)
                     }
@@ -170,7 +172,6 @@ class KvmService : Service() {
             if (KvmState.isMasterMode) {
                 try { injector?.startHardwareMouseMonitor(hwCallback) } catch (_: Exception) {}
             } else {
-                // Prepara o driver HID de Mouse Bluetooth nativo no kernel do Escravo
                 try { injector?.createVirtualMouse() } catch (_: Exception) {}
             }
         }
@@ -217,6 +218,7 @@ class KvmService : Service() {
         startForegroundNotification()
         startFastUdpReceiver()
         bindShizuku()
+        startWatchdogLoop()
 
         if (KvmState.isMasterMode) {
             setupMasterEdgeTriggers()
@@ -226,12 +228,45 @@ class KvmService : Service() {
         }
     }
 
+    // Watchdog de recuperacao de falhas: reconecta Shizuku e libera cursor preso se o Wi-Fi cair
+    private fun startWatchdogLoop() {
+        thread(isDaemon = true, name = "KvmWatchdog") {
+            while (running) {
+                try {
+                    if (injector == null && Shizuku.pingBinder()) {
+                        mainHandler.post { bindShizuku() }
+                    }
+                    val now = SystemClock.elapsedRealtime()
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                        val peer = KvmState.activePeer
+                        if (peer != null) {
+                            UdpFastSender.sendPing(peer)
+                        }
+                        // Se o Escravo ficar >1.4s sem responder ao ping, devolve controle para nunca travar
+                        if (KvmState.lastHeartbeatMs > 0L && (now - KvmState.lastHeartbeatMs) > 1400L) {
+                            KvmState.isRemoteActive = false
+                            releaseCpuWakeLock()
+                            KvmState.captureActivity?.releaseAndClose()
+                        }
+                    } else if (!KvmState.isMasterMode) {
+                        // Se o Mestre parar de enviar sinais por >1.6s, remove o mouse virtual da tela escrava
+                        if (lastSlaveTrafficMs > 0L && (now - lastSlaveTrafficMs) > 1600L) {
+                            lastSlaveTrafficMs = 0L
+                            try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+                Thread.sleep(400)
+            }
+        }
+    }
+
     private fun getFullScreenBounds(): Pair<Float, Float> {
         val bounds = wm.maximumWindowMetrics.bounds
         return Pair(bounds.width().toFloat(), bounds.height().toFloat())
     }
 
-    // Soma a largura/altura de todas as telas ativas no Escravo (tela interna + monitor externo do Samsung DeX)
     private fun updateTotalSlaveWorkspace() {
         var sumW = 0f
         var maxH = 0f
@@ -262,7 +297,7 @@ class KvmService : Service() {
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v3.0 (Mouse HID Nativo)")
+            .setContentTitle("Android KVM v3.1 (HID + Watchdog)")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
@@ -313,6 +348,7 @@ class KvmService : Service() {
                         KvmState.activeEdge = edge
                         KvmState.activePeer = targetPeer
                         KvmState.isRemoteActive = true
+                        KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
                         UdpFastSender.sendEnter(targetPeer, edge, normRatio)
 
                         if (!isScreenLockedOrOff()) {
@@ -405,9 +441,21 @@ class KvmService : Service() {
                     }
                 }
             }
+            KvmState.PKT_PING -> {
+                if (!KvmState.isMasterMode) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
+                    UdpFastSender.sendPong(sender)
+                }
+            }
+            KvmState.PKT_PONG -> {
+                if (KvmState.isMasterMode) {
+                    KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
+                }
+            }
             KvmState.PKT_ENTER -> {
                 if (length >= 6) {
                     masterAddress = sender
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
                     val fromEdge = Edge.fromId(buf.get()) ?: Edge.RIGHT
                     val ratio = buf.getFloat().coerceIn(0f, 1f)
                     updateTotalSlaveWorkspace()
@@ -419,10 +467,8 @@ class KvmService : Service() {
                         Edge.BOTTOM -> Edge.TOP
                     }
 
-                    // Cria o mouse HID Bluetooth real no kernel do Escravo (faz a seta nativa da Samsung aparecer!)
                     try { injector?.createVirtualMouse() } catch (_: Exception) {}
 
-                    // Encosta o cursor nativo na borda exata de entrada empurrando para o canto correspondente
                     when (entryEdge) {
                         Edge.LEFT -> {
                             relX = 16f
@@ -458,10 +504,12 @@ class KvmService : Service() {
                         }
                         null -> {}
                     }
+                    UdpFastSender.sendPong(sender)
                 }
             }
             KvmState.PKT_MOVE -> {
                 if (length >= 9) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
                     val dx = buf.getFloat()
                     val dy = buf.getFloat()
 
@@ -477,7 +525,7 @@ class KvmService : Service() {
                     }
 
                     if (crossedBack && masterAddress != null) {
-                        // Desconecta o mouse virtual HID para a seta nativa sumir imediatamente da tela escrava/DeX
+                        lastSlaveTrafficMs = 0L
                         try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
                         UdpFastSender.sendReturn(masterAddress!!)
                         return
@@ -493,6 +541,7 @@ class KvmService : Service() {
             }
             KvmState.PKT_BTN -> {
                 if (length >= 9) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
                     val action = buf.getInt()
                     val btn = buf.getInt()
                     val bit = when (btn) {
@@ -513,6 +562,7 @@ class KvmService : Service() {
             }
             KvmState.PKT_SCROLL -> {
                 if (length >= 9) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
                     val v = buf.getFloat()
                     val wheelStep = if (v > 0f) 1 else if (v < 0f) -1 else 0
                     if (wheelStep != 0) {

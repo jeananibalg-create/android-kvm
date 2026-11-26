@@ -5,6 +5,7 @@ import com.kvm.mouse.IMouseEventCallback;
 interface IInputInjector {
     void createVirtualMouse();
     void destroyVirtualMouse();
+    boolean isVirtualMouseActive();
     void sendVirtualMouseDelta(int dx, int dy);
     void sendVirtualMouseButton(int buttonMask);
     void sendVirtualMouseScroll(int wheel);

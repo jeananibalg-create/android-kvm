@@ -37,7 +37,6 @@ class InputInjectorService : IInputInjector.Stub() {
     private var hwCallback: IMouseEventCallback? = null
     private val activeReaders = mutableSetOf<String>()
 
-    // Descritor HID padrao de Mouse 3 botoes + Rodinha (reconhecido nativamente pelo Android/One UI/Samsung DeX)
     private val mouseHidDescriptor = byteArrayOf(
         0x05, 0x01,       // Usage Page (Generic Desktop)
         0x09, 0x02,       // Usage (Mouse)
@@ -73,9 +72,6 @@ class InputInjectorService : IInputInjector.Stub() {
         if (uhidOut != null) return
         try {
             val fos = FileOutputStream(File("/dev/uhid"))
-            // struct uhid_event para UHID_CREATE2 (type = 11):
-            // uint32 type (4) + name[128] + phys[64] + uniq[64] + uint16 rd_size (2) + uint16 bus (2)
-            // + uint32 vendor (4) + uint32 product (4) + uint32 version (4) + uint32 country (4) + rd_data[4096]
             val totalSize = 4 + 128 + 64 + 64 + 2 + 2 + 4 + 4 + 4 + 4 + 4096
             val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
 
@@ -85,11 +81,11 @@ class InputInjectorService : IInputInjector.Stub() {
             buf.position(4 + 128 + 64 + 64)
 
             buf.putShort(mouseHidDescriptor.size.toShort())
-            buf.putShort(0x05) // BUS_BLUETOOTH (Android/Samsung trata como mouse Bluetooth nativo!)
+            buf.putShort(0x05) // BUS_BLUETOOTH
             buf.putInt(0x04E8) // Samsung Vendor ID
             buf.putInt(0x7021) // Samsung Bluetooth Mouse Product ID
-            buf.putInt(0x0100) // Version
-            buf.putInt(0)      // Country
+            buf.putInt(0x0100)
+            buf.putInt(0)
             buf.put(mouseHidDescriptor)
 
             fos.write(buf.array())
@@ -105,8 +101,7 @@ class InputInjectorService : IInputInjector.Stub() {
     override fun destroyVirtualMouse() {
         val fos = uhidOut ?: return
         try {
-            // UHID_DESTROY = 1
-            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array()
+            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array() // UHID_DESTROY
             fos.write(buf)
             fos.flush()
             fos.close()
@@ -118,10 +113,12 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     @Synchronized
+    override fun isVirtualMouseActive(): Boolean = uhidOut != null
+
+    @Synchronized
     private fun writeHidReport(buttons: Int, dx: Int, dy: Int, wheel: Int) {
         val fos = uhidOut ?: return
         try {
-            // Quebra movimentos maiores que 127px em multiplos pacotes HID de 8 bits com sinal
             var remX = dx
             var remY = dy
             var first = true
@@ -132,11 +129,9 @@ class InputInjectorService : IInputInjector.Stub() {
                 remX -= stepX
                 remY -= stepY
 
-                // struct uhid_event para UHID_INPUT2 (type = 12):
-                // uint32 type (4) + uint16 size (2) + uint8 data[4096]
                 val buf = ByteBuffer.allocate(4 + 2 + 4).order(ByteOrder.LITTLE_ENDIAN)
                 buf.putInt(12) // UHID_INPUT2
-                buf.putShort(4) // 4 bytes de relatorio HID: [buttons, dx, dy, wheel]
+                buf.putShort(4)
                 buf.put((buttons and 0x07).toByte())
                 buf.put(stepX.toByte())
                 buf.put(stepY.toByte())
@@ -145,6 +140,7 @@ class InputInjectorService : IInputInjector.Stub() {
             }
             fos.flush()
         } catch (_: Exception) {
+            try { fos.close() } catch (_: Exception) {}
             uhidOut = null
         }
     }
@@ -237,8 +233,8 @@ class InputInjectorService : IInputInjector.Stub() {
                         offset += r
                     }
                     bb.rewind()
-                    bb.long // tv_sec
-                    bb.long // tv_usec
+                    bb.long
+                    bb.long
                     val type = bb.short.toInt() and 0xFFFF
                     val code = bb.short.toInt() and 0xFFFF
                     val value = bb.int
