@@ -126,7 +126,7 @@ class KvmService : Service() {
 
     private fun setupMasterEdgeTriggers() {
         val thickness = 4
-        Edge.entries.forEach { edge ->
+        Edge.values().forEach { edge ->
             val view = View(this)
             val params = WindowManager.LayoutParams(
                 if (edge == Edge.LEFT || edge == Edge.RIGHT) thickness else WindowManager.LayoutParams.MATCH_PARENT,

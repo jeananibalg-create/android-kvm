@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(edgesLabel)
 
-        Edge.entries.forEach { edge ->
+        Edge.values().forEach { edge ->
             val btn = Button(this).apply {
                 text = "${edge.label}: Nenhum"
                 gravity = Gravity.START or Gravity.CENTER_VERTICAL
