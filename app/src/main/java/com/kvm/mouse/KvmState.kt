@@ -17,7 +17,6 @@ data class PeerDevice(
 
 object KvmState {
     const val UDP_PORT = 45678
-    const val SERVICE_TYPE = "_androidkvm._udp."
 
     var isMasterMode = true
     var isRunning = false

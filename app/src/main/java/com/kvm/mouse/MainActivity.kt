@@ -33,7 +33,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v1.1 (Shizuku)"
+            text = "Android KVM v1.2 (Shizuku)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
