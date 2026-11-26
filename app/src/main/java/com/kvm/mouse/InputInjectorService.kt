@@ -37,6 +37,7 @@ class InputInjectorService : IInputInjector.Stub() {
 
     @Volatile private var monitoringHardware = false
     private var hwCallback: IMouseEventCallback? = null
+    private val activeReaders = mutableSetOf<String>()
 
     private val rightLongPressRunnable = Runnable {
         if (isRightPressed) {
@@ -47,17 +48,36 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
+    private val rescanRunnable = object : Runnable {
+        override fun run() {
+            if (monitoringHardware) {
+                scanInputDevices()
+                handler.postDelayed(this, 4000)
+            }
+        }
+    }
+
     override fun startHardwareMouseMonitor(callback: IMouseEventCallback?) {
         hwCallback = callback
         if (monitoringHardware) return
         monitoringHardware = true
+        scanInputDevices()
+        handler.postDelayed(rescanRunnable, 4000)
+    }
 
-        thread(isDaemon = true, name = "EvdevMouseMonitor") {
-            val inputDir = File("/dev/input")
-            val files = inputDir.listFiles { f -> f.name.startsWith("event") } ?: emptyArray()
-            files.forEach { evFile ->
-                thread(isDaemon = true, name = "Evdev_${evFile.name}") {
-                    readEvdevLoop(evFile)
+    private fun scanInputDevices() {
+        val inputDir = File("/dev/input")
+        val files = inputDir.listFiles { f -> f.name.startsWith("event") } ?: return
+        files.forEach { evFile ->
+            synchronized(activeReaders) {
+                if (!activeReaders.contains(evFile.name)) {
+                    activeReaders.add(evFile.name)
+                    thread(isDaemon = true, name = "Evdev_${evFile.name}") {
+                        readEvdevLoop(evFile)
+                        synchronized(activeReaders) {
+                            activeReaders.remove(evFile.name)
+                        }
+                    }
                 }
             }
         }
@@ -86,28 +106,28 @@ class InputInjectorService : IInputInjector.Stub() {
                             when (code) {
                                 0x00 -> accX += value.toFloat() // REL_X
                                 0x01 -> accY += value.toFloat() // REL_Y
-                                0x08 -> hwCallback?.onMouseScroll(value.toFloat()) // REL_WHEEL
+                                0x08 -> {
+                                    try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
+                                }
                             }
                         }
                         0x01 -> { // EV_KEY
-                            when (code) {
-                                0x110 -> hwCallback?.onMouseButton(
-                                    if (value == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_UP,
-                                    MotionEvent.BUTTON_PRIMARY
-                                )
-                                0x111 -> hwCallback?.onMouseButton(
-                                    if (value == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_UP,
-                                    MotionEvent.BUTTON_SECONDARY
-                                )
-                                0x112 -> hwCallback?.onMouseButton(
-                                    if (value == 1) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_UP,
-                                    MotionEvent.BUTTON_TERTIARY
-                                )
+                            val action = if (value == 1) MotionEvent.ACTION_DOWN else if (value == 0) MotionEvent.ACTION_UP else -1
+                            if (action != -1) {
+                                val btn = when (code) {
+                                    0x110 -> MotionEvent.BUTTON_PRIMARY
+                                    0x111 -> MotionEvent.BUTTON_SECONDARY
+                                    0x112 -> MotionEvent.BUTTON_TERTIARY
+                                    else -> 0
+                                }
+                                if (btn != 0) {
+                                    try { hwCallback?.onMouseButton(action, btn) } catch (_: Exception) {}
+                                }
                             }
                         }
                         0x00 -> { // EV_SYN
                             if (accX != 0f || accY != 0f) {
-                                hwCallback?.onMouseDelta(accX, accY)
+                                try { hwCallback?.onMouseDelta(accX, accY) } catch (_: Exception) {}
                                 accX = 0f
                                 accY = 0f
                             }
@@ -121,6 +141,7 @@ class InputInjectorService : IInputInjector.Stub() {
 
     override fun stopHardwareMouseMonitor() {
         monitoringHardware = false
+        handler.removeCallbacks(rescanRunnable)
         hwCallback = null
     }
 

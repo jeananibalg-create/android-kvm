@@ -22,9 +22,9 @@ class PointerCaptureActivity : Activity() {
         KvmState.captureActivity = this
         KvmState.isRemoteActive = true
 
-        setShowWhenLocked(true)
-
-        // Sem FLAG_KEEP_SCREEN_ON para a tela apagar normalmente
+        // Nao usa showWhenLocked nem KEEP_SCREEN_ON para a tela apagar normalmente
+        setShowWhenLocked(false)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.addFlags(
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
@@ -35,7 +35,6 @@ class PointerCaptureActivity : Activity() {
         }
         window.setDimAmount(0f)
 
-        // Totalmente transparente e limpo, sem textos no topo
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
         }
@@ -79,7 +78,8 @@ class PointerCaptureActivity : Activity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            releaseAndClose()
+            KvmState.isRemoteActive = false
+            releaseCaptureWindowOnly()
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -135,6 +135,16 @@ class PointerCaptureActivity : Activity() {
         }
     }
 
+    // Fecha apenas a janela de captura, mantendo isRemoteActive intacto caso a tela tenha bloqueado
+    fun releaseCaptureWindowOnly() {
+        runOnUiThread {
+            try { captureView.releasePointerCapture() } catch (_: Exception) {}
+            KvmState.captureActivity = null
+            finish()
+            overridePendingTransition(0, 0)
+        }
+    }
+
     fun releaseAndClose() {
         runOnUiThread {
             try { captureView.releasePointerCapture() } catch (_: Exception) {}
@@ -150,7 +160,6 @@ class PointerCaptureActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         KvmState.captureActivity = null
-        KvmState.isRemoteActive = false
         super.onDestroy()
     }
 }

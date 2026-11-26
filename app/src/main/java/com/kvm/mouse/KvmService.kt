@@ -4,9 +4,11 @@ import android.app.KeyguardManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.graphics.PixelFormat
 import android.net.wifi.WifiManager
@@ -54,14 +56,27 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(4)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(5)
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+                // Fecha a Activity transparente na hora para o painel AMOLED apagar 100%
+                // O controle continua automaticamente via Shizuku (/dev/input)
+                KvmState.captureActivity?.releaseCaptureWindowOnly()
+            }
+        }
+    }
+
+    private fun isHeadlessActive(): Boolean {
+        return !powerManager.isInteractive || keyguardManager.isKeyguardLocked || KvmState.captureActivity == null
+    }
 
     private val hwCallback = object : IMouseEventCallback.Stub() {
         override fun onMouseDelta(dx: Float, dy: Float) {
             if (!KvmState.isMasterMode) return
-            val isLockedOrOff = !powerManager.isInteractive || keyguardManager.isKeyguardLocked
-            // Quando a tela está apagada ou bloqueada com senha/digital, assume controle direto via hardware
-            if (isLockedOrOff) {
+            // Quando a Activity de captura nao esta aberta (tela apagada ou bloqueada com senha/digital)
+            if (KvmState.captureActivity == null) {
                 val (w, h) = getFullScreenBounds()
                 if (!KvmState.isRemoteActive) {
                     virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
@@ -94,8 +109,7 @@ class KvmService : Service() {
 
         override fun onMouseButton(action: Int, button: Int) {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
-            val isLockedOrOff = !powerManager.isInteractive || keyguardManager.isKeyguardLocked
-            if (isLockedOrOff && KvmState.captureActivity == null) {
+            if (KvmState.captureActivity == null) {
                 val peer = KvmState.activePeer ?: return
                 if (button == MotionEvent.BUTTON_TERTIARY && action == MotionEvent.ACTION_DOWN) {
                     UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
@@ -107,8 +121,7 @@ class KvmService : Service() {
 
         override fun onMouseScroll(vScroll: Float) {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
-            val isLockedOrOff = !powerManager.isInteractive || keyguardManager.isKeyguardLocked
-            if (isLockedOrOff && KvmState.captureActivity == null) {
+            if (KvmState.captureActivity == null) {
                 val peer = KvmState.activePeer ?: return
                 UdpFastSender.sendScroll(peer, vScroll, 0f)
             }
@@ -149,6 +162,8 @@ class KvmService : Service() {
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
+        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("kvm_lock").apply {
             setReferenceCounted(true)
@@ -180,7 +195,7 @@ class KvmService : Service() {
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v2.2 Ativo")
+            .setContentTitle("Android KVM v2.3 Ativo")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
@@ -233,14 +248,18 @@ class KvmService : Service() {
                         KvmState.isRemoteActive = true
                         UdpFastSender.sendEnter(targetPeer, edge, normRatio)
 
-                        val intent = Intent(this, PointerCaptureActivity::class.java).apply {
-                            addFlags(
-                                Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_NO_ANIMATION or
-                                Intent.FLAG_ACTIVITY_NO_USER_ACTION
-                            )
+                        // Se a tela estiver desbloqueada e acesa, prende o cursor com PointerCaptureActivity
+                        // Se estiver bloqueada, o modo Headless via Shizuku ja assume sem acordar a tela
+                        if (powerManager.isInteractive && !keyguardManager.isKeyguardLocked) {
+                            val intent = Intent(this, PointerCaptureActivity::class.java).apply {
+                                addFlags(
+                                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                                    Intent.FLAG_ACTIVITY_NO_USER_ACTION
+                                )
+                            }
+                            startActivity(intent)
                         }
-                        startActivity(intent)
                     }
                 }
                 false
@@ -448,6 +467,7 @@ class KvmService : Service() {
 
     override fun onDestroy() {
         running = false
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         udpSocket?.close()
         try { multicastLock?.release() } catch (_: Exception) {}
         edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
