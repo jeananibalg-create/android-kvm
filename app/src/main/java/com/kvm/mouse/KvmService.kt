@@ -199,7 +199,6 @@ class KvmService : Service() {
 
     private fun startBeaconLoop() {
         thread(isDaemon = true, name = "KvmSlaveBeacon") {
-            val payload = ByteArray(64)
             val modelBytes = Build.MODEL.toByteArray()
             val len = modelBytes.size.coerceAtMost(60)
             val pktData = ByteBuffer.allocate(2 + len).put(KvmState.PKT_HELLO).put(len.toByte()).put(modelBytes, 0, len).array()
