@@ -2,7 +2,6 @@ package com.kvm.mouse
 
 import android.hardware.input.InputManager
 import android.os.Handler
-import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
@@ -27,19 +26,6 @@ class InputInjectorService : IInputInjector.Stub() {
         InputManager::class.java.getMethod("getInstance").invoke(null) as InputManager
     }
 
-    private val systemInputService: Any? by lazy {
-        try {
-            val smClass = Class.forName("android.os.ServiceManager")
-            val getService = smClass.getDeclaredMethod("getService", String::class.java)
-            val binder = getService.invoke(null, "input") as IBinder
-            val stubClass = Class.forName("android.hardware.input.IInputManager\$Stub")
-            val asInterface = stubClass.getDeclaredMethod("asInterface", IBinder::class.java)
-            asInterface.invoke(null, binder)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
     private val injectMethod by lazy {
         InputManager::class.java.getMethod(
             "injectInputEvent",
@@ -53,10 +39,8 @@ class InputInjectorService : IInputInjector.Stub() {
     private var currentButtonsMask = 0
 
     @Volatile private var monitoringHardware = false
-    @Volatile private var isSilenced = false
     private var hwCallback: IMouseEventCallback? = null
     private val openMouseFds = ConcurrentHashMap<String, FileDescriptor>()
-    private val disabledDeviceIds = ConcurrentHashMap<Int, Boolean>()
 
     private val mouseHidDescriptor = byteArrayOf(
         0x05, 0x01,       // Usage Page (Generic Desktop)
@@ -88,17 +72,6 @@ class InputInjectorService : IInputInjector.Stub() {
         0xC0.toByte()        // End Collection
     )
 
-    private fun unlockHiddenApis() {
-        try {
-            val vmRuntimeClass = Class.forName("dalvik.system.VMRuntime")
-            val getRuntime = vmRuntimeClass.getDeclaredMethod("getRuntime")
-            val setExemptions = vmRuntimeClass.getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
-            val runtime = getRuntime.invoke(null)
-            setExemptions.invoke(runtime, arrayOf("L"))
-        } catch (_: Exception) {
-        }
-    }
-
     private fun isPhysicalMouseDevice(eventName: String): Boolean {
         try {
             val sysBase = File("/sys/class/input/$eventName/device")
@@ -129,35 +102,16 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
-    // Desabilita/habilita o mouse fisico na camada IInputManager do Android para que ele NAO acorde a tela do Mestre
-    // enquanto nosso leitor bruto /dev/input/eventX continua capturando os movimentos normalmente
-    override fun setLocalMouseSilenced(silenced: Boolean) {
-        unlockHiddenApis()
-        isSilenced = silenced
-        val svc = systemInputService ?: return
-
+    // Emula as politicas do plugin Samsung Multi Control: coloca o pacote na whitelist do Doze
+    // e configura o comportamento de despertar por perifericos sem desabilitar o mouse
+    override fun applyMultiControlSystemPolicy(enableLockscreenMode: Boolean) {
         try {
-            if (silenced) {
-                val ids = InputDevice.getDeviceIds()
-                val disableMethod = svc.javaClass.getDeclaredMethod("disableInputDevice", Int::class.javaPrimitiveType).apply {
-                    isAccessible = true
-                }
-                for (id in ids) {
-                    val dev = InputDevice.getDevice(id) ?: continue
-                    val isMouse = (dev.sources and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
-                    if (isMouse && !dev.name.contains("KVM", ignoreCase = true)) {
-                        disableMethod.invoke(svc, id)
-                        disabledDeviceIds[id] = true
-                    }
-                }
-            } else {
-                val enableMethod = svc.javaClass.getDeclaredMethod("enableInputDevice", Int::class.javaPrimitiveType).apply {
-                    isAccessible = true
-                }
-                disabledDeviceIds.keys.forEach { id ->
-                    try { enableMethod.invoke(svc, id) } catch (_: Exception) {}
-                }
-                disabledDeviceIds.clear()
+            Runtime.getRuntime().exec(arrayOf("dumpsys", "deviceidle", "whitelist", "+com.kvm.mouse"))
+            Runtime.getRuntime().exec(arrayOf("cmd", "appops", "set", "com.kvm.mouse", "SYSTEM_ALERT_WINDOW", "allow"))
+            Runtime.getRuntime().exec(arrayOf("cmd", "appops", "set", "com.kvm.mouse", "RUN_IN_BACKGROUND", "allow"))
+            Runtime.getRuntime().exec(arrayOf("cmd", "appops", "set", "com.kvm.mouse", "RUN_ANY_IN_BACKGROUND", "allow"))
+            if (enableLockscreenMode) {
+                Runtime.getRuntime().exec(arrayOf("settings", "put", "secure", "wake_gesture_enabled", "0"))
             }
         } catch (_: Exception) {
         }
@@ -172,7 +126,7 @@ class InputInjectorService : IInputInjector.Stub() {
             val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
 
             buf.putInt(11) // UHID_CREATE2
-            val nameBytes = "Samsung Bluetooth Mouse KVM".toByteArray(Charsets.UTF_8)
+            val nameBytes = "Samsung Multi Control Mouse".toByteArray(Charsets.UTF_8)
             buf.put(nameBytes)
             buf.position(4 + 128 + 64 + 64)
 
@@ -261,9 +215,6 @@ class InputInjectorService : IInputInjector.Stub() {
         override fun run() {
             if (monitoringHardware) {
                 scanMouseDevicesOnly()
-                if (isSilenced) {
-                    setLocalMouseSilenced(true)
-                }
                 handler.postDelayed(this, 2500)
             }
         }
@@ -287,7 +238,6 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     override fun startHardwareMouseMonitor(callback: IMouseEventCallback?) {
-        unlockHiddenApis()
         hwCallback = callback
         if (monitoringHardware) return
         monitoringHardware = true
@@ -382,7 +332,6 @@ class InputInjectorService : IInputInjector.Stub() {
 
     override fun stopHardwareMouseMonitor() {
         monitoringHardware = false
-        setLocalMouseSilenced(false)
         handler.removeCallbacks(rescanRunnable)
         openMouseFds.values.forEach { fd ->
             try { Os.close(fd) } catch (_: Exception) {}

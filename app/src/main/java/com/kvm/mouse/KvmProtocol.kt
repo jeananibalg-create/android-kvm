@@ -46,6 +46,7 @@ object KvmState {
 
     var isMasterMode = true
     var isRunning = false
+    var allowLockscreenControl = true
     var pointerSpeed = 1.35f
 
     val discoveredPeers = mutableMapOf<String, PeerDevice>()
@@ -62,6 +63,7 @@ object KvmState {
         val ed = prefs.edit()
         ed.putBoolean("isMasterMode", isMasterMode)
         ed.putBoolean("isRunning", isRunning)
+        ed.putBoolean("allowLockscreenControl", allowLockscreenControl)
         ed.putFloat("pointerSpeed", pointerSpeed)
         Edge.values().forEach { edge ->
             val p = edgeAssignments[edge]
@@ -80,6 +82,7 @@ object KvmState {
         val prefs = context.getSharedPreferences("kvm_prefs", Context.MODE_PRIVATE)
         isMasterMode = prefs.getBoolean("isMasterMode", true)
         isRunning = prefs.getBoolean("isRunning", false)
+        allowLockscreenControl = prefs.getBoolean("allowLockscreenControl", true)
         pointerSpeed = prefs.getFloat("pointerSpeed", 1.35f)
         Edge.values().forEach { edge ->
             val ip = prefs.getString("edge_${edge.name}_ip", null)
@@ -96,9 +99,6 @@ object KvmState {
     }
 }
 
-// Transporte Hibrido v4.0:
-// - TCP persistente com TCP_NODELAY para comandos criticos (ENTER, RETURN, CLICKS, SCROLL, PING) -> 100% entrega garantida
-// - UDP ultra-rapido para delta de movimento continuo (dx, dy) -> latencia minima sem bloqueio
 object HybridTransport {
     private data class UdpPacket(val data: ByteArray, val host: InetAddress, val port: Int)
     private data class TcpPacket(val data: ByteArray, val host: InetAddress)
@@ -115,7 +115,7 @@ object HybridTransport {
                     val pkt = udpQueue.take()
                     val s = udpSocket ?: DatagramSocket().apply {
                         broadcast = true
-                        trafficClass = 0x10 // IPTOS_LOWDELAY
+                        trafficClass = 0x10
                     }.also { udpSocket = it }
                     s.send(DatagramPacket(pkt.data, pkt.data.size, pkt.host, pkt.port))
                 } catch (_: Exception) {
@@ -146,7 +146,6 @@ object HybridTransport {
                     }
                 }
                 if (!sent) {
-                    // Fallback UDP caso o destino ainda esteja abrindo a porta TCP
                     udpQueue.offer(UdpPacket(pkt.data, pkt.host, KvmState.UDP_PORT))
                 }
             }
@@ -162,7 +161,7 @@ object HybridTransport {
         val sock = Socket().apply {
             tcpNoDelay = true
             keepAlive = true
-            trafficClass = 0x10 // IPTOS_LOWDELAY
+            trafficClass = 0x10
             connect(InetSocketAddress(host, KvmState.TCP_PORT), 600)
         }
         tcpConnections[ipKey] = sock
@@ -202,7 +201,6 @@ object HybridTransport {
     fun sendReturn(host: InetAddress) {
         val buf = byteArrayOf(KvmState.PKT_RETURN)
         tcpQueue.offer(TcpPacket(buf, host))
-        // Envia tambem via UDP redundante para latencia zero na volta
         udpQueue.offer(UdpPacket(buf, host, KvmState.UDP_PORT))
     }
 

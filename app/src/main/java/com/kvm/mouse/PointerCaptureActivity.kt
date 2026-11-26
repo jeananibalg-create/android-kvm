@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -22,7 +23,10 @@ class PointerCaptureActivity : Activity() {
         KvmState.captureActivity = this
         KvmState.isRemoteActive = true
 
-        setShowWhenLocked(false)
+        // Emula a camada Samsung Multi Control: funciona sobre a tela de bloqueio sem acender a tela sozinha
+        setShowWhenLocked(KvmState.allowLockscreenControl)
+        setTurnScreenOn(false)
+
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
         window.addFlags(
@@ -35,7 +39,9 @@ class PointerCaptureActivity : Activity() {
         window.setDimAmount(0f)
 
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(2, 0, 0, 0))
+            setBackgroundColor(Color.argb(1, 0, 0, 0))
+            // Seta invisivel no Mestre enquanto controla outra tela (comportamento Multi Control)
+            pointerIcon = PointerIcon.getSystemIcon(this@PointerCaptureActivity, PointerIcon.TYPE_NULL)
         }
 
         captureView = object : View(this) {
@@ -46,6 +52,7 @@ class PointerCaptureActivity : Activity() {
         }.apply {
             isFocusable = true
             isFocusableInTouchMode = true
+            pointerIcon = PointerIcon.getSystemIcon(this@PointerCaptureActivity, PointerIcon.TYPE_NULL)
         }
 
         root.addView(captureView, FrameLayout.LayoutParams(-1, -1))
@@ -59,7 +66,7 @@ class PointerCaptureActivity : Activity() {
             if (!isFinishing) {
                 captureView.requestFocus()
                 captureView.requestPointerCapture()
-                if (!captureView.hasPointerCapture() && retryCount < 25) {
+                if (!captureView.hasPointerCapture() && retryCount < 30) {
                     retryCount++
                     ensurePointerCapture()
                 }
@@ -136,15 +143,6 @@ class PointerCaptureActivity : Activity() {
                     HybridTransport.sendScroll(peer, v, h)
                 }
             }
-        }
-    }
-
-    fun releaseCaptureWindowOnly() {
-        runOnUiThread {
-            try { captureView.releasePointerCapture() } catch (_: Exception) {}
-            KvmState.captureActivity = null
-            finish()
-            overridePendingTransition(0, 0)
         }
     }
 

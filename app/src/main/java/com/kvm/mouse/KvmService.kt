@@ -70,28 +70,43 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(12)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(13)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                KvmState.captureActivity?.releaseCaptureWindowOnly()
-                if (KvmState.isMasterMode && KvmState.isRemoteActive) {
-                    // Desabilita o mouse na camada InputManager do Mestre para que mexer o mouse NAO acorde a tela
-                    try { injector?.setLocalMouseSilenced(true) } catch (_: Exception) {}
-                    acquireCpuOnlyWakeLock()
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    if (KvmState.isMasterMode && KvmState.allowLockscreenControl) {
+                        acquireCpuOnlyWakeLock()
+                    }
+                }
+                Intent.ACTION_USER_PRESENT, Intent.ACTION_SCREEN_ON -> {
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive && KvmState.captureActivity == null && KvmState.allowLockscreenControl) {
+                        launchMultiControlCapture()
+                    }
                 }
             }
         }
     }
 
+    private fun launchMultiControlCapture() {
+        val intent = Intent(this, PointerCaptureActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                Intent.FLAG_ACTIVITY_NO_USER_ACTION
+            )
+        }
+        startActivity(intent)
+    }
+
     private fun acquireCpuOnlyWakeLock() {
         try {
             if (cpuWakeLock == null) {
-                cpuWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AndroidKVM:CpuBluetoothLock")
+                cpuWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AndroidKVM:MultiControlLock")
             }
             if (cpuWakeLock?.isHeld == false) {
-                cpuWakeLock?.acquire(4 * 60 * 60 * 1000L)
+                cpuWakeLock?.acquire(6 * 60 * 60 * 1000L)
             }
         } catch (_: Exception) {
         }
@@ -106,75 +121,81 @@ class KvmService : Service() {
         }
     }
 
-    private fun isScreenLockedOrOff(): Boolean {
+    private fun isScreenOffOrLocked(): Boolean {
         return !powerManager.isInteractive || keyguardManager.isKeyguardLocked
     }
 
+    // Leitura bruta /dev/input/eventX: assume automaticamente sempre que PointerCaptureActivity nao esta com foco
+    // (por exemplo, quando a tela do Mestre esta apagada ou bloqueada)
     private val hwCallback = object : IMouseEventCallback.Stub() {
         override fun onMouseDelta(dx: Float, dy: Float) {
             if (!KvmState.isMasterMode) return
+            if (isScreenOffOrLocked() && !KvmState.allowLockscreenControl) return
 
-            if (isScreenLockedOrOff() || (KvmState.isRemoteActive && KvmState.captureActivity == null)) {
-                val (w, h) = getFullScreenBounds()
-                if (!KvmState.isRemoteActive) {
-                    virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
-                    virtualMasterY = (virtualMasterY + dy).coerceIn(0f, h)
+            // Se PointerCaptureActivity esta ativa e com foco, ela mesma ja envia os eventos sem duplicar
+            if (KvmState.captureActivity != null && powerManager.isInteractive) return
 
-                    val crossedEdge = when {
-                        virtualMasterX >= w - 2f && KvmState.edgeAssignments[Edge.RIGHT] != null -> Edge.RIGHT
-                        virtualMasterX <= 2f && KvmState.edgeAssignments[Edge.LEFT] != null -> Edge.LEFT
-                        virtualMasterY <= 2f && KvmState.edgeAssignments[Edge.TOP] != null -> Edge.TOP
-                        virtualMasterY >= h - 2f && KvmState.edgeAssignments[Edge.BOTTOM] != null -> Edge.BOTTOM
-                        else -> null
-                    }
-                    if (crossedEdge != null) {
-                        val peer = KvmState.edgeAssignments[crossedEdge] ?: return
-                        val ratio = when (crossedEdge) {
-                            Edge.LEFT, Edge.RIGHT -> (virtualMasterY / h).coerceIn(0f, 1f)
-                            Edge.TOP, Edge.BOTTOM -> (virtualMasterX / w).coerceIn(0f, 1f)
-                        }
-                        KvmState.activeEdge = crossedEdge
-                        KvmState.activePeer = peer
-                        KvmState.isRemoteActive = true
-                        KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
-                        try { injector?.setLocalMouseSilenced(true) } catch (_: Exception) {}
-                        acquireCpuOnlyWakeLock()
-                        HybridTransport.sendEnter(peer, crossedEdge, ratio)
-                    }
-                } else {
-                    val peer = KvmState.activePeer ?: return
-                    HybridTransport.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
+            val (w, h) = getFullScreenBounds()
+            if (!KvmState.isRemoteActive) {
+                virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
+                virtualMasterY = (virtualMasterY + dy).coerceIn(0f, h)
+
+                val crossedEdge = when {
+                    virtualMasterX >= w - 2f && KvmState.edgeAssignments[Edge.RIGHT] != null -> Edge.RIGHT
+                    virtualMasterX <= 2f && KvmState.edgeAssignments[Edge.LEFT] != null -> Edge.LEFT
+                    virtualMasterY <= 2f && KvmState.edgeAssignments[Edge.TOP] != null -> Edge.TOP
+                    virtualMasterY >= h - 2f && KvmState.edgeAssignments[Edge.BOTTOM] != null -> Edge.BOTTOM
+                    else -> null
                 }
+                if (crossedEdge != null) {
+                    val peer = KvmState.edgeAssignments[crossedEdge] ?: return
+                    val ratio = when (crossedEdge) {
+                        Edge.LEFT, Edge.RIGHT -> (virtualMasterY / h).coerceIn(0f, 1f)
+                        Edge.TOP, Edge.BOTTOM -> (virtualMasterX / w).coerceIn(0f, 1f)
+                    }
+                    KvmState.activeEdge = crossedEdge
+                    KvmState.activePeer = peer
+                    KvmState.isRemoteActive = true
+                    KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
+                    acquireCpuOnlyWakeLock()
+                    HybridTransport.sendEnter(peer, crossedEdge, ratio)
+
+                    if (powerManager.isInteractive && KvmState.allowLockscreenControl) {
+                        mainHandler.post { launchMultiControlCapture() }
+                    }
+                }
+            } else {
+                val peer = KvmState.activePeer ?: return
+                HybridTransport.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
             }
         }
 
         override fun onMouseButton(action: Int, button: Int) {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
-            if (isScreenLockedOrOff() || KvmState.captureActivity == null) {
-                val peer = KvmState.activePeer ?: return
-                HybridTransport.sendButton(peer, action, button)
-            }
+            if (isScreenOffOrLocked() && !KvmState.allowLockscreenControl) return
+            if (KvmState.captureActivity != null && powerManager.isInteractive) return
+            val peer = KvmState.activePeer ?: return
+            HybridTransport.sendButton(peer, action, button)
         }
 
         override fun onMouseScroll(vScroll: Float) {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
-            if (isScreenLockedOrOff() || KvmState.captureActivity == null) {
-                val peer = KvmState.activePeer ?: return
-                HybridTransport.sendScroll(peer, vScroll, 0f)
-            }
+            if (isScreenOffOrLocked() && !KvmState.allowLockscreenControl) return
+            if (KvmState.captureActivity != null && powerManager.isInteractive) return
+            val peer = KvmState.activePeer ?: return
+            HybridTransport.sendScroll(peer, vScroll, 0f)
         }
     }
 
     private val shizukuConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             injector = IInputInjector.Stub.asInterface(service)
+            try {
+                injector?.applyMultiControlSystemPolicy(KvmState.allowLockscreenControl)
+            } catch (_: Exception) {}
+
             if (KvmState.isMasterMode) {
-                try {
-                    injector?.startHardwareMouseMonitor(hwCallback)
-                    if (KvmState.isRemoteActive) {
-                        injector?.setLocalMouseSilenced(true)
-                    }
-                } catch (_: Exception) {}
+                try { injector?.startHardwareMouseMonitor(hwCallback) } catch (_: Exception) {}
             } else {
                 try { injector?.createVirtualMouse() } catch (_: Exception) {}
             }
@@ -210,7 +231,12 @@ class KvmService : Service() {
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
-        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        registerReceiver(screenReceiver, filter)
 
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("kvm_lock").apply {
@@ -238,6 +264,9 @@ class KvmService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         KvmState.loadConfig(this)
+        try {
+            injector?.applyMultiControlSystemPolicy(KvmState.allowLockscreenControl)
+        } catch (_: Exception) {}
         return START_STICKY
     }
 
@@ -267,14 +296,13 @@ class KvmService : Service() {
                         if (peer != null) {
                             HybridTransport.sendPing(peer)
                         }
-                        if (KvmState.lastHeartbeatMs > 0L && (now - KvmState.lastHeartbeatMs) > 2200L) {
+                        if (KvmState.lastHeartbeatMs > 0L && (now - KvmState.lastHeartbeatMs) > 2500L) {
                             KvmState.isRemoteActive = false
-                            try { injector?.setLocalMouseSilenced(false) } catch (_: Exception) {}
                             releaseCpuWakeLock()
                             KvmState.captureActivity?.releaseAndClose()
                         }
                     } else if (!KvmState.isMasterMode) {
-                        if (lastSlaveTrafficMs > 0L && (now - lastSlaveTrafficMs) > 2500L) {
+                        if (lastSlaveTrafficMs > 0L && (now - lastSlaveTrafficMs) > 2800L) {
                             lastSlaveTrafficMs = 0L
                             try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
                         }
@@ -324,7 +352,7 @@ class KvmService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v4.0 (TCP + UDP Low-Latency)")
+            .setContentTitle("Android KVM v5.0 (Multi Control)")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setOngoing(true)
@@ -367,6 +395,7 @@ class KvmService : Service() {
 
             view.setOnHoverListener { _, event ->
                 if (event.action == MotionEvent.ACTION_HOVER_ENTER) {
+                    if (isScreenOffOrLocked() && !KvmState.allowLockscreenControl) return@setOnHoverListener false
                     val targetPeer = KvmState.edgeAssignments[edge]
                     if (targetPeer != null && KvmState.captureActivity == null && !KvmState.isRemoteActive) {
                         val (w, h) = getFullScreenBounds()
@@ -379,19 +408,10 @@ class KvmService : Service() {
                         KvmState.isRemoteActive = true
                         KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
                         HybridTransport.sendEnter(targetPeer, edge, normRatio)
+                        acquireCpuOnlyWakeLock()
 
-                        if (!isScreenLockedOrOff()) {
-                            val intent = Intent(this, PointerCaptureActivity::class.java).apply {
-                                addFlags(
-                                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
-                                    Intent.FLAG_ACTIVITY_NO_USER_ACTION
-                                )
-                            }
-                            startActivity(intent)
-                        } else {
-                            try { injector?.setLocalMouseSilenced(true) } catch (_: Exception) {}
-                            acquireCpuOnlyWakeLock()
+                        if (powerManager.isInteractive) {
+                            launchMultiControlCapture()
                         }
                     }
                 }
@@ -654,8 +674,6 @@ class KvmService : Service() {
                     null -> {}
                 }
                 KvmState.isRemoteActive = false
-                // Reativa o mouse no Android do S25 Plus e acorda a tela do Mestre apenas neste momento
-                try { injector?.setLocalMouseSilenced(false) } catch (_: Exception) {}
                 releaseCpuWakeLock()
                 KvmState.captureActivity?.releaseAndClose()
 
@@ -675,7 +693,6 @@ class KvmService : Service() {
         try { multicastLock?.release() } catch (_: Exception) {}
         try { wifiLowLatencyLock?.release() } catch (_: Exception) {}
         edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
-        try { injector?.setLocalMouseSilenced(false) } catch (_: Exception) {}
         try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
         try { injector?.stopHardwareMouseMonitor() } catch (_: Exception) {}
         try { Shizuku.unbindUserService(userServiceArgs, shizukuConnection, true) } catch (_: Exception) {}

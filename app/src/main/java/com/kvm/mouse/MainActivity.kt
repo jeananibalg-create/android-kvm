@@ -13,7 +13,9 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -29,14 +31,19 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         KvmState.loadConfig(this)
 
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(Color.BLACK)
+        }
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
-            setPadding(48, 64, 48, 48)
+            setPadding(48, 56, 48, 56)
         }
+        scroll.addView(root)
 
         val title = TextView(this).apply {
-            text = "Android KVM v4.0 (TCP+UDP)"
+            text = "Android KVM v5.0 (Multi Control)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -46,7 +53,7 @@ class MainActivity : AppCompatActivity() {
             text = "IP local: ${KvmService.getLocalIpAddress()}"
             textSize = 14f
             setTextColor(Color.GREEN)
-            setPadding(0, 12, 0, 24)
+            setPadding(0, 10, 0, 20)
         }
         root.addView(statusText)
 
@@ -57,10 +64,30 @@ class MainActivity : AppCompatActivity() {
         modeRow.addView(btnSlave, LinearLayout.LayoutParams(0, -2, 1f))
         root.addView(modeRow)
 
+        val lockSwitch = Switch(this).apply {
+            text = "Funcionar na Tela de Bloqueio (Multi Control)"
+            setTextColor(Color.CYAN)
+            isChecked = KvmState.allowLockscreenControl
+            setPadding(0, 24, 0, 12)
+            setOnCheckedChangeListener { _, isChecked ->
+                KvmState.allowLockscreenControl = isChecked
+                KvmState.saveConfig(this@MainActivity)
+                if (KvmState.isRunning) {
+                    startForegroundService(Intent(this@MainActivity, KvmService::class.java))
+                }
+                Toast.makeText(
+                    this@MainActivity,
+                    if (isChecked) "Modo Tela de Bloqueio ATIVADO" else "Modo Tela de Bloqueio DESATIVADO",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+        root.addView(lockSwitch)
+
         val edgesLabel = TextView(this).apply {
             text = "\nPosição dos celulares escravos (Modo Mestre):"
             setTextColor(Color.WHITE)
-            setPadding(0, 20, 0, 8)
+            setPadding(0, 12, 0, 8)
         }
         root.addView(edgesLabel)
 
@@ -173,7 +200,7 @@ class MainActivity : AppCompatActivity() {
             statusText.text = "Modo: ESCRAVO | IP: ${KvmService.getLocalIpAddress()}"
         }
 
-        setContentView(root)
+        setContentView(scroll)
     }
 
     private fun showPeerSelector(edge: Edge) {

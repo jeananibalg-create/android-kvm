@@ -11,7 +11,7 @@ interface IInputInjector {
     void sendVirtualMouseScroll(int wheel);
     void injectKey(int keyCode);
     void setScreenPower(boolean on);
-    void setLocalMouseSilenced(boolean silenced);
+    void applyMultiControlSystemPolicy(boolean enableLockscreenMode);
     void startHardwareMouseMonitor(IMouseEventCallback callback);
     void stopHardwareMouseMonitor();
     void destroy();
