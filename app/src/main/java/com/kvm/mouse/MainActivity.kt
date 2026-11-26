@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
@@ -26,6 +27,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        KvmState.loadConfig(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -34,7 +36,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v3.2 (EVIOCGRAB + HID)"
+            text = "Android KVM v3.3"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -63,8 +65,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(edgesLabel)
 
         Edge.values().forEach { edge ->
+            val savedPeer = KvmState.edgeAssignments[edge]
             val btn = Button(this).apply {
-                text = "${edge.label}: Nenhum"
+                text = "${edge.label}: ${savedPeer?.name ?: "Nenhum"}"
                 gravity = Gravity.START or Gravity.CENTER_VERTICAL
                 setOnClickListener { showPeerSelector(edge) }
             }
@@ -73,18 +76,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         val speedLabel = TextView(this).apply {
-            text = "\nVelocidade da seta no Escravo: 1.35x"
+            text = "\nVelocidade da seta no Escravo: ${String.format("%.2f", KvmState.pointerSpeed)}x"
             setTextColor(Color.LTGRAY)
         }
         root.addView(speedLabel)
 
         val speedBar = SeekBar(this).apply {
             max = 250
-            progress = 85
+            progress = ((KvmState.pointerSpeed - 0.5f) * 100f).toInt().coerceIn(0, 250)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     val speed = 0.5f + (progress / 100f)
                     KvmState.pointerSpeed = speed
+                    KvmState.saveConfig(this@MainActivity)
                     speedLabel.text = "Velocidade da seta no Escravo: ${String.format("%.2f", speed)}x"
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -111,9 +115,25 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(btnOverlay)
 
+        val btnBattery = Button(this).apply {
+            text = "3. Manter em 2º Plano (Sem restrição bateria)"
+            setOnClickListener {
+                val pm = getSystemService(POWER_SERVICE) as PowerManager
+                if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } else {
+                    Toast.makeText(this@MainActivity, "Já está sem restrição de bateria!", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        root.addView(btnBattery)
+
         val btnToggleService = Button(this).apply {
-            text = "INICIAR SERVIÇO KVM"
-            setBackgroundColor(Color.parseColor("#1B5E20"))
+            text = if (KvmState.isRunning) "PARAR SERVIÇO KVM" else "INICIAR SERVIÇO KVM"
+            setBackgroundColor(Color.parseColor(if (KvmState.isRunning) "#B71C1C" else "#1B5E20"))
             setTextColor(Color.WHITE)
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
@@ -121,8 +141,9 @@ class MainActivity : AppCompatActivity() {
                     return@setOnClickListener
                 }
                 if (!KvmState.isRunning) {
-                    startForegroundService(Intent(this@MainActivity, KvmService::class.java))
                     KvmState.isRunning = true
+                    KvmState.saveConfig(this@MainActivity)
+                    startForegroundService(Intent(this@MainActivity, KvmService::class.java))
                     text = "PARAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#B71C1C"))
                     statusText.text = if (KvmState.isMasterMode)
@@ -130,8 +151,9 @@ class MainActivity : AppCompatActivity() {
                     else
                         "ESCRAVO HID ATIVO - IP: ${KvmService.getLocalIpAddress()}"
                 } else {
-                    stopService(Intent(this@MainActivity, KvmService::class.java))
                     KvmState.isRunning = false
+                    KvmState.saveConfig(this@MainActivity)
+                    stopService(Intent(this@MainActivity, KvmService::class.java))
                     text = "INICIAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#1B5E20"))
                     statusText.text = "IP local: ${KvmService.getLocalIpAddress()}"
@@ -142,10 +164,12 @@ class MainActivity : AppCompatActivity() {
 
         btnMaster.setOnClickListener {
             KvmState.isMasterMode = true
+            KvmState.saveConfig(this)
             statusText.text = "Modo: MESTRE | IP: ${KvmService.getLocalIpAddress()}"
         }
         btnSlave.setOnClickListener {
             KvmState.isMasterMode = false
+            KvmState.saveConfig(this)
             statusText.text = "Modo: ESCRAVO | IP: ${KvmService.getLocalIpAddress()}"
         }
 
@@ -162,12 +186,14 @@ class MainActivity : AppCompatActivity() {
                 when (which) {
                     0 -> {
                         KvmState.edgeAssignments[edge] = null
+                        KvmState.saveConfig(this)
                         edgeButtons[edge]?.text = "${edge.label}: Nenhum"
                     }
                     1 -> showManualIpDialog(edge)
                     else -> {
                         val chosen = peers[which - 2]
                         KvmState.edgeAssignments[edge] = chosen
+                        KvmState.saveConfig(this)
                         edgeButtons[edge]?.text = "${edge.label}: ${chosen.name}"
                     }
                 }
@@ -193,6 +219,7 @@ class MainActivity : AppCompatActivity() {
                             val peer = PeerDevice("Manual ($ipStr)", addr, KvmState.UDP_PORT)
                             KvmState.discoveredPeers[peer.name] = peer
                             KvmState.edgeAssignments[edge] = peer
+                            KvmState.saveConfig(this)
                             runOnUiThread {
                                 edgeButtons[edge]?.text = "${edge.label}: $ipStr"
                                 Toast.makeText(this, "Conectado ao IP $ipStr!", Toast.LENGTH_SHORT).show()

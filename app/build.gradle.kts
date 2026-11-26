@@ -11,8 +11,8 @@ android {
         applicationId = "com.kvm.mouse"
         minSdk = 30
         targetSdk = 34
-        versionCode = 11
-        versionName = "3.2"
+        versionCode = 12
+        versionName = "3.3"
     }
 
     buildTypes {

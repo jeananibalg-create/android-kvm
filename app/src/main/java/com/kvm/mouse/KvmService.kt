@@ -1,8 +1,10 @@
 package com.kvm.mouse
 
+import android.app.AlarmManager
 import android.app.KeyguardManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -63,16 +65,28 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(10)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(11)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                KvmState.captureActivity?.releaseCaptureWindowOnly()
-                if (KvmState.isMasterMode && KvmState.isRemoteActive) {
-                    // Agarra exclusivamente o mouse no kernel para o Bluetooth nao acordar a tela nem dar toques fantasmas
-                    try { injector?.setMouseGrabbed(true) } catch (_: Exception) {}
-                    acquireCpuOnlyWakeLock()
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    KvmState.captureActivity?.releaseCaptureWindowOnly()
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                        try { injector?.setMouseGrabbed(true) } catch (_: Exception) {}
+                        acquireCpuOnlyWakeLock()
+                    }
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    // Garante que se o mouse estiver no Escravo, a tela do Mestre apaga imediatamente caso algo tente acorda-la
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                        try { injector?.setMouseGrabbed(true) } catch (_: Exception) {}
+                        mainHandler.postDelayed({
+                            if (KvmState.isRemoteActive) {
+                                try { injector?.setScreenPower(false) } catch (_: Exception) {}
+                            }
+                        }, 30)
+                    }
                 }
             }
         }
@@ -195,12 +209,19 @@ class KvmService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        KvmState.loadConfig(this)
+        KvmState.isRunning = true
+
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
-        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        registerReceiver(screenReceiver, filter)
 
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("kvm_lock").apply {
@@ -219,6 +240,25 @@ class KvmService : Service() {
         } else {
             startBeaconLoop()
         }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        KvmState.loadConfig(this)
+        return START_STICKY
+    }
+
+    // Impede que fechar o app nos Recentes da One UI derrube o servico KVM
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (KvmState.isRunning) {
+            val restartIntent = Intent(applicationContext, KvmService::class.java)
+            val pending = PendingIntent.getForegroundService(
+                applicationContext, 1002, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 500, pending)
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun startWatchdogLoop() {
@@ -287,10 +327,15 @@ class KvmService : Service() {
         manager.createNotificationChannel(
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
+        val openAppIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v3.2 (EVIOCGRAB + HID)")
+            .setContentTitle("Android KVM v3.3 Ativo em Segundo Plano")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setOngoing(true)
+            .setContentIntent(openAppIntent)
             .build()
         startForeground(1, notification)
     }
@@ -580,12 +625,10 @@ class KvmService : Service() {
                     null -> {}
                 }
                 KvmState.isRemoteActive = false
-                // Devolve o mouse fisico ao S25 Plus
                 try { injector?.setMouseGrabbed(false) } catch (_: Exception) {}
                 releaseCpuWakeLock()
                 KvmState.captureActivity?.releaseAndClose()
 
-                // Agora sim, como a seta voltou para o Mestre, acende a tela do Mestre
                 if (!powerManager.isInteractive) {
                     try { injector?.setScreenPower(true) } catch (_: Exception) {}
                 }

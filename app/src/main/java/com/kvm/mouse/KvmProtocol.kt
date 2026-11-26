@@ -1,5 +1,6 @@
 package com.kvm.mouse
 
+import android.content.Context
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -49,6 +50,44 @@ object KvmState {
     @Volatile var captureActivity: PointerCaptureActivity? = null
     @Volatile var isRemoteActive = false
     @Volatile var lastHeartbeatMs = 0L
+
+    fun saveConfig(context: Context) {
+        val prefs = context.getSharedPreferences("kvm_prefs", Context.MODE_PRIVATE)
+        val ed = prefs.edit()
+        ed.putBoolean("isMasterMode", isMasterMode)
+        ed.putBoolean("isRunning", isRunning)
+        ed.putFloat("pointerSpeed", pointerSpeed)
+        Edge.values().forEach { edge ->
+            val p = edgeAssignments[edge]
+            if (p != null) {
+                ed.putString("edge_${edge.name}_name", p.name)
+                ed.putString("edge_${edge.name}_ip", p.host.hostAddress)
+            } else {
+                ed.remove("edge_${edge.name}_name")
+                ed.remove("edge_${edge.name}_ip")
+            }
+        }
+        ed.apply()
+    }
+
+    fun loadConfig(context: Context) {
+        val prefs = context.getSharedPreferences("kvm_prefs", Context.MODE_PRIVATE)
+        isMasterMode = prefs.getBoolean("isMasterMode", true)
+        isRunning = prefs.getBoolean("isRunning", false)
+        pointerSpeed = prefs.getFloat("pointerSpeed", 1.35f)
+        Edge.values().forEach { edge ->
+            val ip = prefs.getString("edge_${edge.name}_ip", null)
+            val name = prefs.getString("edge_${edge.name}_name", null)
+            if (!ip.isNullOrEmpty() && !name.isNullOrEmpty()) {
+                try {
+                    val peer = PeerDevice(name, InetAddress.getByName(ip), UDP_PORT)
+                    edgeAssignments[edge] = peer
+                    discoveredPeers[name] = peer
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
 }
 
 object UdpFastSender {
