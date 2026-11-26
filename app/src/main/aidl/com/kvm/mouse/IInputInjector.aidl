@@ -6,6 +6,7 @@ interface IInputInjector {
     void createVirtualMouse();
     void destroyVirtualMouse();
     boolean isVirtualMouseActive();
+    int getDetectedMouseCount();
     void sendVirtualMouseDelta(int dx, int dy);
     void sendVirtualMouseButton(int buttonMask);
     void sendVirtualMouseScroll(int wheel);

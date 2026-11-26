@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
@@ -26,6 +28,24 @@ import kotlin.concurrent.thread
 class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private val edgeButtons = mutableMapOf<Edge, Button>()
+    private val uiHandler = Handler(Looper.getMainLooper())
+
+    private val statusRefresher = object : Runnable {
+        override fun run() {
+            val ip = KvmService.getLocalIpAddress()
+            val shizukuStr = if (KvmState.shizukuConnected) "Shizuku: OK" else "Shizuku: Desconectado"
+            statusText.text = if (KvmState.isRunning) {
+                if (KvmState.isMasterMode) {
+                    "MESTRE ATIVO | IP: $ip\n$shizukuStr | Mouses HW: ${KvmState.detectedMouseCount}"
+                } else {
+                    "ESCRAVO ATIVO | IP: $ip\n$shizukuStr | UHID Virtual: Pronto"
+                }
+            } else {
+                "Parado | IP: $ip | $shizukuStr"
+            }
+            uiHandler.postDelayed(this, 1000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,7 +63,7 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(root)
 
         val title = TextView(this).apply {
-            text = "Android KVM v6.0 (Kernel C Grab)"
+            text = "Android KVM v6.2"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -173,17 +193,12 @@ class MainActivity : AppCompatActivity() {
                     startForegroundService(Intent(this@MainActivity, KvmService::class.java))
                     text = "PARAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#B71C1C"))
-                    statusText.text = if (KvmState.isMasterMode)
-                        "MESTRE ATIVO (IP: ${KvmService.getLocalIpAddress()})"
-                    else
-                        "ESCRAVO HID ATIVO - IP: ${KvmService.getLocalIpAddress()}"
                 } else {
                     KvmState.isRunning = false
                     KvmState.saveConfig(this@MainActivity)
                     stopService(Intent(this@MainActivity, KvmService::class.java))
                     text = "INICIAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#1B5E20"))
-                    statusText.text = "IP local: ${KvmService.getLocalIpAddress()}"
                 }
             }
         }
@@ -192,15 +207,19 @@ class MainActivity : AppCompatActivity() {
         btnMaster.setOnClickListener {
             KvmState.isMasterMode = true
             KvmState.saveConfig(this)
-            statusText.text = "Modo: MESTRE | IP: ${KvmService.getLocalIpAddress()}"
         }
         btnSlave.setOnClickListener {
             KvmState.isMasterMode = false
             KvmState.saveConfig(this)
-            statusText.text = "Modo: ESCRAVO | IP: ${KvmService.getLocalIpAddress()}"
         }
 
         setContentView(scroll)
+        uiHandler.post(statusRefresher)
+    }
+
+    override fun onDestroy() {
+        uiHandler.removeCallbacks(statusRefresher)
+        super.onDestroy()
     }
 
     private fun showPeerSelector(edge: Edge) {

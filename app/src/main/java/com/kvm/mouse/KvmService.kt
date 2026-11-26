@@ -66,7 +66,7 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(14)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(16)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -103,8 +103,6 @@ class KvmService : Service() {
         return !powerManager.isInteractive || keyguardManager.isKeyguardLocked
     }
 
-    // Recebe 100% dos pulsos do mouse direto do kernel via C/JNI EVIOCGRAB:
-    // Quando isRemoteActive == true, o kernel entrega os movimentos APENAS aqui e ZERO para a tela do Mestre!
     private val hwCallback = object : IMouseEventCallback.Stub() {
         override fun onMouseDelta(dx: Float, dy: Float) {
             if (!KvmState.isMasterMode) return
@@ -155,7 +153,6 @@ class KvmService : Service() {
         KvmState.activePeer = peer
         KvmState.isRemoteActive = true
         KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
-        // Ativa EVIOCGRAB nativo no kernel: o S25 Plus para de receber qualquer evento do mouse e NUNCA acende a tela!
         try { injector?.setKernelMouseGrab(true) } catch (_: Exception) {}
         acquireCpuOnlyWakeLock()
         ReliableUdpTransport.sendEnter(peer, edge, normRatio)
@@ -174,7 +171,6 @@ class KvmService : Service() {
         KvmState.isRemoteActive = false
         KvmState.activePeer = null
         KvmState.activeEdge = null
-        // Libera EVIOCGRAB nativo no kernel: o mouse volta imediatamente para o S25 Plus
         try { injector?.setKernelMouseGrab(false) } catch (_: Exception) {}
         releaseCpuWakeLock()
     }
@@ -182,6 +178,7 @@ class KvmService : Service() {
     private val shizukuConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             injector = IInputInjector.Stub.asInterface(service)
+            KvmState.shizukuConnected = true
             try {
                 injector?.applyMultiControlSystemPolicy(KvmState.allowLockscreenControl)
             } catch (_: Exception) {}
@@ -190,6 +187,7 @@ class KvmService : Service() {
                 try {
                     injector?.startHardwareMouseMonitor(hwCallback)
                     injector?.setKernelMouseGrab(KvmState.isRemoteActive)
+                    KvmState.detectedMouseCount = injector?.detectedMouseCount ?: 0
                 } catch (_: Exception) {}
             } else {
                 try { injector?.createVirtualMouse() } catch (_: Exception) {}
@@ -197,6 +195,8 @@ class KvmService : Service() {
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             injector = null
+            KvmState.shizukuConnected = false
+            KvmState.detectedMouseCount = 0
         }
     }
 
@@ -278,6 +278,8 @@ class KvmService : Service() {
                 try {
                     if (injector == null && Shizuku.pingBinder()) {
                         mainHandler.post { bindShizuku() }
+                    } else if (injector != null && KvmState.isMasterMode) {
+                        KvmState.detectedMouseCount = injector?.detectedMouseCount ?: 0
                     }
                     val now = SystemClock.elapsedRealtime()
                     if (KvmState.isMasterMode && KvmState.isRemoteActive) {
@@ -339,7 +341,7 @@ class KvmService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v6.0 (Kernel EVIOCGRAB)")
+            .setContentTitle("Android KVM v6.2 Ativo")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setOngoing(true)

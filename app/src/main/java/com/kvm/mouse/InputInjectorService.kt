@@ -5,11 +5,15 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.system.Os
+import android.system.OsConstants
 import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.File
+import java.io.FileDescriptor
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -37,7 +41,7 @@ class InputInjectorService : IInputInjector.Stub() {
     @Volatile private var monitoringHardware = false
     @Volatile private var isGrabbed = false
     private var hwCallback: IMouseEventCallback? = null
-    private val openNativeFds = ConcurrentHashMap<String, Int>()
+    private val openMouseFds = ConcurrentHashMap<String, FileDescriptor>()
 
     private val mouseHidDescriptor = byteArrayOf(
         0x05, 0x01,       // Usage Page (Generic Desktop)
@@ -69,6 +73,17 @@ class InputInjectorService : IInputInjector.Stub() {
         0xC0.toByte()        // End Collection
     )
 
+    private fun unlockHiddenApis() {
+        try {
+            val vmRuntimeClass = Class.forName("dalvik.system.VMRuntime")
+            val getRuntime = vmRuntimeClass.getDeclaredMethod("getRuntime")
+            val setExemptions = vmRuntimeClass.getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
+            val runtime = getRuntime.invoke(null)
+            setExemptions.invoke(runtime, arrayOf("L"))
+        } catch (_: Exception) {
+        }
+    }
+
     private fun hasKernelBit(hexWords: String, bit: Int): Boolean {
         val parts = hexWords.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
         if (parts.isEmpty()) return false
@@ -81,7 +96,6 @@ class InputInjectorService : IInputInjector.Stub() {
         return ((wordVal ushr bitInWord) and 1L) == 1L
     }
 
-    // Identifica qualquer mouse USB/Bluetooth real: precisa ter REL_X (0), REL_Y (1) e BTN_LEFT (0x110 = 272)
     private fun isPhysicalMouseDevice(eventName: String): Boolean {
         try {
             val sysBase = File("/sys/class/input/$eventName/device")
@@ -98,25 +112,51 @@ class InputInjectorService : IInputInjector.Stub() {
             val relHex = relFile.readText().trim()
             val keyHex = keyFile.readText().trim()
 
-            val hasRelX = hasKernelBit(relHex, 0x00)
-            val hasRelY = hasKernelBit(relHex, 0x01)
-            val hasBtnLeft = hasKernelBit(keyHex, 0x110)
-
-            return hasRelX && hasRelY && hasBtnLeft
+            return hasKernelBit(relHex, 0x00) && hasKernelBit(relHex, 0x01) && hasKernelBit(keyHex, 0x110)
         } catch (_: Exception) {
             return false
         }
     }
 
-    override fun setKernelMouseGrab(grab: Boolean) {
-        isGrabbed = grab
-        openNativeFds.values.forEach { rawFd ->
-            try {
-                NativeEvdev.grabDevice(rawFd, grab)
-            } catch (_: Exception) {
-            }
+    private fun applyIoctlGrab(fd: FileDescriptor, grab: Boolean) {
+        unlockHiddenApis()
+        val EVIOCGRAB = 0x40044590
+        val arg = if (grab) 1 else 0
+        try {
+            val ioctlMethod = Os::class.java.getDeclaredMethod(
+                "ioctlInt",
+                FileDescriptor::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            )
+            ioctlMethod.isAccessible = true
+            ioctlMethod.invoke(null, fd, EVIOCGRAB, arg)
+            return
+        } catch (_: Exception) {
+        }
+        try {
+            val libcoreClass = Class.forName("libcore.io.Libcore")
+            val osField = libcoreClass.getDeclaredField("os").apply { isAccessible = true }.get(null)
+            val ioctlMethod = osField.javaClass.getDeclaredMethod(
+                "ioctlInt",
+                FileDescriptor::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            )
+            ioctlMethod.isAccessible = true
+            ioctlMethod.invoke(osField, fd, EVIOCGRAB, arg)
+        } catch (_: Exception) {
         }
     }
+
+    override fun setKernelMouseGrab(grab: Boolean) {
+        isGrabbed = grab
+        openMouseFds.values.forEach { fd ->
+            try { applyIoctlGrab(fd, grab) } catch (_: Exception) {}
+        }
+    }
+
+    override fun getDetectedMouseCount(): Int = openMouseFds.size
 
     override fun applyMultiControlSystemPolicy(enableLockscreenMode: Boolean) {
         try {
@@ -252,6 +292,7 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     override fun startHardwareMouseMonitor(callback: IMouseEventCallback?) {
+        unlockHiddenApis()
         hwCallback = callback
         if (monitoringHardware) return
         monitoringHardware = true
@@ -263,8 +304,8 @@ class InputInjectorService : IInputInjector.Stub() {
         val inputDir = File("/dev/input")
         val files = inputDir.listFiles { f -> f.name.startsWith("event") } ?: return
         files.forEach { evFile ->
-            if (!openNativeFds.containsKey(evFile.name) && isPhysicalMouseDevice(evFile.name)) {
-                thread(isDaemon = true, name = "NativeMouse_${evFile.name}") {
+            if (!openMouseFds.containsKey(evFile.name) && isPhysicalMouseDevice(evFile.name)) {
+                thread(isDaemon = true, name = "MouseEvdev_${evFile.name}") {
                     readMouseLoop(evFile)
                 }
             }
@@ -272,67 +313,79 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     private fun readMouseLoop(file: File) {
-        val rawFd = NativeEvdev.openDevice(file.absolutePath)
-        if (rawFd < 0) return
-        openNativeFds[file.name] = rawFd
-        if (isGrabbed) {
-            NativeEvdev.grabDevice(rawFd, true)
-        }
-
-        val evData = LongArray(3)
-        var accX = 0f
-        var accY = 0f
-
+        var fd: FileDescriptor? = null
         try {
-            while (monitoringHardware) {
-                val res = NativeEvdev.readEvent(rawFd, evData)
-                if (res <= 0) break
+            fd = Os.open(file.absolutePath, OsConstants.O_RDONLY, 0)
+            openMouseFds[file.name] = fd
+            if (isGrabbed) {
+                applyIoctlGrab(fd, true)
+            }
 
-                val type = evData[0].toInt()
-                val code = evData[1].toInt()
-                val value = evData[2].toInt()
+            FileInputStream(fd).use { fis ->
+                val buf = ByteArray(24)
+                val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+                var accX = 0f
+                var accY = 0f
 
-                when (type) {
-                    0x02 -> { // EV_REL
-                        when (code) {
-                            0x00 -> accX += value.toFloat()
-                            0x01 -> accY += value.toFloat()
-                            0x08 -> {
-                                try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
-                            }
-                        }
+                while (monitoringHardware) {
+                    var offset = 0
+                    while (offset < 24) {
+                        val r = fis.read(buf, offset, 24 - offset)
+                        if (r <= 0) return
+                        offset += r
                     }
-                    0x01 -> { // EV_KEY
-                        val action = when (value) {
-                            1 -> MotionEvent.ACTION_DOWN
-                            0 -> MotionEvent.ACTION_UP
-                            else -> -1
-                        }
-                        if (action != -1) {
-                            val btn = when (code) {
-                                0x110 -> MotionEvent.BUTTON_PRIMARY
-                                0x111 -> MotionEvent.BUTTON_SECONDARY
-                                0x112 -> MotionEvent.BUTTON_TERTIARY
-                                else -> 0
+                    bb.rewind()
+                    bb.long
+                    bb.long
+                    val type = bb.short.toInt() and 0xFFFF
+                    val code = bb.short.toInt() and 0xFFFF
+                    val value = bb.int
+
+                    when (type) {
+                        0x02 -> { // EV_REL
+                            when (code) {
+                                0x00 -> accX += value.toFloat()
+                                0x01 -> accY += value.toFloat()
+                                0x08 -> {
+                                    try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
+                                }
                             }
-                            if (btn != 0) {
-                                try { hwCallback?.onMouseButton(action, btn) } catch (_: Exception) {}
+                        }
+                        0x01 -> { // EV_KEY
+                            val action = when (value) {
+                                1 -> MotionEvent.ACTION_DOWN
+                                0 -> MotionEvent.ACTION_UP
+                                else -> -1
+                            }
+                            if (action != -1) {
+                                val btn = when (code) {
+                                    0x110 -> MotionEvent.BUTTON_PRIMARY
+                                    0x111 -> MotionEvent.BUTTON_SECONDARY
+                                    0x112 -> MotionEvent.BUTTON_TERTIARY
+                                    else -> 0
+                                }
+                                if (btn != 0) {
+                                    try { hwCallback?.onMouseButton(action, btn) } catch (_: Exception) {}
+                                }
                             }
                         }
-                    }
-                    0x00 -> { // EV_SYN
-                        if (accX != 0f || accY != 0f) {
-                            try { hwCallback?.onMouseDelta(accX, accY) } catch (_: Exception) {}
-                            accX = 0f
-                            accY = 0f
+                        0x00 -> { // EV_SYN
+                            if (accX != 0f || accY != 0f) {
+                                try { hwCallback?.onMouseDelta(accX, accY) } catch (_: Exception) {}
+                                accX = 0f
+                                accY = 0f
+                            }
                         }
                     }
                 }
             }
         } catch (_: Exception) {
         } finally {
-            openNativeFds.remove(file.name)
-            try { NativeEvdev.closeDevice(rawFd) } catch (_: Exception) {}
+            openMouseFds.remove(file.name)
+            if (fd != null) {
+                try { applyIoctlGrab(fd, false) } catch (_: Exception) {}
+                try { Os.close(fd) } catch (_: Exception) {}
+            }
         }
     }
 
@@ -340,10 +393,11 @@ class InputInjectorService : IInputInjector.Stub() {
         monitoringHardware = false
         isGrabbed = false
         handler.removeCallbacks(rescanRunnable)
-        openNativeFds.values.forEach { rawFd ->
-            try { NativeEvdev.closeDevice(rawFd) } catch (_: Exception) {}
+        openMouseFds.values.forEach { fd ->
+            try { applyIoctlGrab(fd, false) } catch (_: Exception) {}
+            try { Os.close(fd) } catch (_: Exception) {}
         }
-        openNativeFds.clear()
+        openMouseFds.clear()
         hwCallback = null
     }
 

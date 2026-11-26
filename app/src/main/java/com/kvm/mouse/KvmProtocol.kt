@@ -54,6 +54,9 @@ object KvmState {
     @Volatile var lastHeartbeatMs = 0L
     @Volatile var pendingReturnAck = false
 
+    @Volatile var shizukuConnected = false
+    @Volatile var detectedMouseCount = 0
+
     fun saveConfig(context: Context) {
         val prefs = context.getSharedPreferences("kvm_prefs", Context.MODE_PRIVATE)
         val ed = prefs.edit()
@@ -95,8 +98,6 @@ object KvmState {
     }
 }
 
-// Transporte UDP Não-Bloqueante com Confirmação (ACK) para eventos críticos:
-// Nunca trava a thread nem congela o app se o Wi-Fi entrar em economia de energia.
 object ReliableUdpTransport {
     private data class OutPacket(val data: ByteArray, val host: InetAddress, val port: Int)
     private val queue = LinkedBlockingQueue<OutPacket>(1024)
@@ -109,7 +110,7 @@ object ReliableUdpTransport {
                     val pkt = queue.take()
                     val s = socket ?: DatagramSocket().apply {
                         broadcast = true
-                        trafficClass = 0x10 // IPTOS_LOWDELAY
+                        trafficClass = 0x10
                     }.also { socket = it }
                     s.send(DatagramPacket(pkt.data, pkt.data.size, pkt.host, pkt.port))
                 } catch (_: Exception) {
@@ -127,7 +128,6 @@ object ReliableUdpTransport {
 
     fun sendButton(peer: PeerDevice, action: Int, button: Int) {
         val buf = ByteBuffer.allocate(9).put(KvmState.PKT_BTN).putInt(action).putInt(button).array()
-        // Envia 2 rajadas espacadas por 8ms para garantir entrega de clique sem bloquear
         queue.offer(OutPacket(buf, peer.host, peer.port))
     }
 
@@ -144,7 +144,6 @@ object ReliableUdpTransport {
     fun sendEnter(peer: PeerDevice, edge: Edge, ratio: Float) {
         val buf = ByteBuffer.allocate(6).put(KvmState.PKT_ENTER).put(edge.id).putFloat(ratio).array()
         queue.offer(OutPacket(buf, peer.host, peer.port))
-        // Rajada dupla rapida para entrada instantanea
         thread(isDaemon = true) {
             Thread.sleep(25)
             if (KvmState.isRemoteActive) {
