@@ -104,8 +104,8 @@ class InputInjectorService : IInputInjector.Stub() {
                     when (type) {
                         0x02 -> { // EV_REL
                             when (code) {
-                                0x00 -> accX += value.toFloat() // REL_X
-                                0x01 -> accY += value.toFloat() // REL_Y
+                                0x00 -> accX += value.toFloat()
+                                0x01 -> accY += value.toFloat()
                                 0x08 -> {
                                     try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
                                 }

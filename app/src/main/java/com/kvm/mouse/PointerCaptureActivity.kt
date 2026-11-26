@@ -22,21 +22,21 @@ class PointerCaptureActivity : Activity() {
         KvmState.captureActivity = this
         KvmState.isRemoteActive = true
 
-        // Nao usa showWhenLocked nem KEEP_SCREEN_ON para a tela apagar normalmente
         setShowWhenLocked(false)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
         window.addFlags(
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         )
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
         window.setDimAmount(0f)
 
+        // Alpha 2/255 (invisivel a olho nu, mas obriga o SurfaceFlinger da One UI a dar foco e prender o cursor nativo)
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.TRANSPARENT)
+            setBackgroundColor(Color.argb(2, 0, 0, 0))
         }
 
         captureView = object : View(this) {
@@ -60,12 +60,12 @@ class PointerCaptureActivity : Activity() {
             if (!isFinishing) {
                 captureView.requestFocus()
                 captureView.requestPointerCapture()
-                if (!captureView.hasPointerCapture() && retryCount < 20) {
+                if (!captureView.hasPointerCapture() && retryCount < 25) {
                     retryCount++
                     ensurePointerCapture()
                 }
             }
-        }, 16)
+        }, 12)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -78,8 +78,7 @@ class PointerCaptureActivity : Activity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            KvmState.isRemoteActive = false
-            releaseCaptureWindowOnly()
+            releaseAndClose()
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -135,7 +134,6 @@ class PointerCaptureActivity : Activity() {
         }
     }
 
-    // Fecha apenas a janela de captura, mantendo isRemoteActive intacto caso a tela tenha bloqueado
     fun releaseCaptureWindowOnly() {
         runOnUiThread {
             try { captureView.releasePointerCapture() } catch (_: Exception) {}
