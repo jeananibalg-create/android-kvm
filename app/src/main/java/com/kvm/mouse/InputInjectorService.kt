@@ -3,6 +3,8 @@ package com.kvm.mouse
 import android.hardware.input.InputManager
 import android.os.SystemClock
 import android.view.InputDevice
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
 import android.view.MotionEvent
 import kotlin.system.exitProcess
 
@@ -17,41 +19,59 @@ class InputInjectorService : IInputInjector.Stub() {
             Int::class.javaPrimitiveType
         )
     }
+
     private var downTime = 0L
+    private var isPressed = false
 
     override fun injectMove(x: Float, y: Float) {
         val now = SystemClock.uptimeMillis()
-        val action = if (downTime > 0L) MotionEvent.ACTION_MOVE else MotionEvent.ACTION_HOVER_MOVE
-        val dTime = if (downTime > 0L) downTime else now
-        dispatch(dTime, now, action, x, y, if (downTime > 0L) MotionEvent.BUTTON_PRIMARY else 0, 0f, 0f)
+        if (isPressed) {
+            dispatchMotion(downTime, now, MotionEvent.ACTION_MOVE, x, y, MotionEvent.BUTTON_PRIMARY, 0f, 0f)
+        } else {
+            dispatchMotion(now, now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0, 0f, 0f)
+        }
     }
 
     override fun injectButton(action: Int, x: Float, y: Float, buttonState: Int) {
         val now = SystemClock.uptimeMillis()
         if (action == MotionEvent.ACTION_DOWN) {
             downTime = now
-            dispatch(downTime, now, MotionEvent.ACTION_DOWN, x, y, buttonState, 0f, 0f)
-            dispatch(downTime, now, MotionEvent.ACTION_BUTTON_PRESS, x, y, buttonState, 0f, 0f)
+            isPressed = true
+            dispatchMotion(downTime, now, MotionEvent.ACTION_DOWN, x, y, MotionEvent.BUTTON_PRIMARY, 0f, 0f)
+            dispatchMotion(downTime, now, MotionEvent.ACTION_BUTTON_PRESS, x, y, MotionEvent.BUTTON_PRIMARY, 0f, 0f)
         } else if (action == MotionEvent.ACTION_UP) {
             val dTime = if (downTime > 0L) downTime else now
-            dispatch(dTime, now, MotionEvent.ACTION_BUTTON_RELEASE, x, y, 0, 0f, 0f)
-            dispatch(dTime, now, MotionEvent.ACTION_UP, x, y, 0, 0f, 0f)
+            dispatchMotion(dTime, now, MotionEvent.ACTION_BUTTON_RELEASE, x, y, 0, 0f, 0f)
+            dispatchMotion(dTime, now, MotionEvent.ACTION_UP, x, y, 0, 0f, 0f)
+            isPressed = false
             downTime = 0L
         }
     }
 
     override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float) {
         val now = SystemClock.uptimeMillis()
-        dispatch(now, now, MotionEvent.ACTION_SCROLL, x, y, 0, vScroll, hScroll)
+        dispatchMotion(now, now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0, 0f, 0f)
+        dispatchMotion(now, now, MotionEvent.ACTION_SCROLL, x, y, 0, vScroll * 2.2f, hScroll * 2.2f)
     }
 
-    private fun dispatch(
-        downTime: Long,
-        eventTime: Long,
+    override fun injectKey(keyCode: Int) {
+        val now = SystemClock.uptimeMillis()
+        try {
+            val down = KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD)
+            val up = KeyEvent(now, now + 15, KeyEvent.ACTION_UP, keyCode, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD)
+            injectMethod.invoke(inputManager, down, 0)
+            injectMethod.invoke(inputManager, up, 0)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun dispatchMotion(
+        dTime: Long,
+        eTime: Long,
         action: Int,
         x: Float,
         y: Float,
-        buttonState: Int,
+        btnState: Int,
         vScroll: Float,
         hScroll: Float
     ) {
@@ -63,14 +83,14 @@ class InputInjectorService : IInputInjector.Stub() {
             val coords = arrayOf(MotionEvent.PointerCoords().apply {
                 this.x = x
                 this.y = y
-                pressure = if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) 1.0f else 0.0f
+                pressure = if (isPressed) 1.0f else 0.0f
                 size = 1.0f
                 setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
                 setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
             })
             val event = MotionEvent.obtain(
-                downTime, eventTime, action, 1, props, coords,
-                0, buttonState, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0
+                dTime, eTime, action, 1, props, coords,
+                0, btnState, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0
             )
             injectMethod.invoke(inputManager, event, 0)
             event.recycle()

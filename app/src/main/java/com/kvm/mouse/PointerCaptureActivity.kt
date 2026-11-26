@@ -2,7 +2,6 @@ package com.kvm.mouse
 
 import android.app.Activity
 import android.graphics.Color
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -17,7 +16,8 @@ import android.widget.TextView
 class PointerCaptureActivity : Activity() {
     private lateinit var captureView: View
     private val handler = Handler(Looper.getMainLooper())
-    private var captureRetryCount = 0
+    private var retryCount = 0
+    private var lastButtonState = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -25,8 +25,12 @@ class PointerCaptureActivity : Activity() {
 
         window.addFlags(
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         )
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
         window.setDimAmount(0f)
 
         val root = FrameLayout(this).apply {
@@ -34,10 +38,10 @@ class PointerCaptureActivity : Activity() {
         }
 
         val hint = TextView(this).apply {
-            text = "Mouse no Escravo (Voltar = resgatar cursor)"
+            text = "Cursor no Fold 4  |  Botão Direito = Voltar  |  Botão Meio = Início"
             textSize = 11f
-            setTextColor(Color.argb(140, 255, 255, 255))
-            setPadding(24, 48, 24, 16)
+            setTextColor(Color.argb(160, 255, 255, 255))
+            setPadding(24, 64, 24, 16)
         }
         root.addView(hint, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
@@ -54,25 +58,25 @@ class PointerCaptureActivity : Activity() {
         root.addView(captureView, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
         captureView.requestFocus()
-        scheduleCaptureAttempt()
+        ensurePointerCapture()
     }
 
-    private fun scheduleCaptureAttempt() {
+    private fun ensurePointerCapture() {
         handler.postDelayed({
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !isFinishing) {
+            if (!isFinishing) {
                 captureView.requestFocus()
                 captureView.requestPointerCapture()
-                if (!captureView.hasPointerCapture() && captureRetryCount < 15) {
-                    captureRetryCount++
-                    scheduleCaptureAttempt()
+                if (!captureView.hasPointerCapture() && retryCount < 20) {
+                    retryCount++
+                    ensurePointerCapture()
                 }
             }
-        }, 40)
+        }, 16)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (hasFocus) {
             captureView.requestFocus()
             captureView.requestPointerCapture()
         }
@@ -92,37 +96,51 @@ class PointerCaptureActivity : Activity() {
             MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
                 var dx = 0f
                 var dy = 0f
-                if (event.historySize > 0) {
-                    for (i in 0 until event.historySize) {
-                        dx += event.getHistoricalX(i)
-                        dy += event.getHistoricalY(i)
-                    }
+                for (i in 0 until event.historySize) {
+                    dx += event.getHistoricalX(i)
+                    dy += event.getHistoricalY(i)
                 }
                 dx += event.x
                 dy += event.y
                 if (dx != 0f || dy != 0f) {
-                    KvmService.sendUdp(peer, "MOVE:$dx:$dy")
+                    UdpFastSender.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
                 }
             }
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_BUTTON_PRESS -> {
-                KvmService.sendUdp(peer, "BTN:${MotionEvent.ACTION_DOWN}:${event.buttonState}")
+                val pressed = event.buttonState and lastButtonState.inv()
+                lastButtonState = event.buttonState
+                when {
+                    (pressed and MotionEvent.BUTTON_SECONDARY) != 0 -> {
+                        UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_BACK)
+                    }
+                    (pressed and MotionEvent.BUTTON_TERTIARY) != 0 -> {
+                        UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
+                    }
+                    else -> {
+                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_PRIMARY)
+                    }
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_BUTTON_RELEASE -> {
-                KvmService.sendUdp(peer, "BTN:${MotionEvent.ACTION_UP}:0")
+                val released = lastButtonState and event.buttonState.inv()
+                lastButtonState = event.buttonState
+                if ((released and MotionEvent.BUTTON_PRIMARY) != 0 || event.buttonState == 0) {
+                    UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, 0)
+                }
             }
             MotionEvent.ACTION_SCROLL -> {
                 val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
                 val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
-                KvmService.sendUdp(peer, "SCR:$v:$h")
+                if (v != 0f || h != 0f) {
+                    UdpFastSender.sendScroll(peer, v, h)
+                }
             }
         }
     }
 
     fun releaseAndClose() {
         runOnUiThread {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                try { captureView.releasePointerCapture() } catch (_: Exception) {}
-            }
+            try { captureView.releasePointerCapture() } catch (_: Exception) {}
             KvmState.captureActivity = null
             KvmState.activePeer = null
             KvmState.activeEdge = null

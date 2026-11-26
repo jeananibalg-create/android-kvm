@@ -12,12 +12,13 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
 import java.net.InetAddress
-import java.util.concurrent.Executors
+import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
@@ -33,14 +34,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v1.2 (Shizuku)"
+            text = "Android KVM v2.0 (Zero-Latency)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
         root.addView(title)
 
         statusText = TextView(this).apply {
-            text = "IP deste aparelho: ${KvmService.getLocalIpAddress()}"
+            text = "IP local: ${KvmService.getLocalIpAddress()}"
             textSize = 14f
             setTextColor(Color.GREEN)
             setPadding(0, 12, 0, 24)
@@ -57,11 +58,11 @@ class MainActivity : AppCompatActivity() {
         val edgesLabel = TextView(this).apply {
             text = "\nPosição dos celulares escravos (Modo Mestre):"
             setTextColor(Color.WHITE)
-            setPadding(0, 24, 0, 12)
+            setPadding(0, 20, 0, 8)
         }
         root.addView(edgesLabel)
 
-        Edge.values().forEach { edge ->
+        Edge.entries.forEach { edge ->
             val btn = Button(this).apply {
                 text = "${edge.label}: Nenhum"
                 gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -70,6 +71,27 @@ class MainActivity : AppCompatActivity() {
             edgeButtons[edge] = btn
             root.addView(btn)
         }
+
+        val speedLabel = TextView(this).apply {
+            text = "\nVelocidade da seta no Escravo: 1.35x"
+            setTextColor(Color.LTGRAY)
+        }
+        root.addView(speedLabel)
+
+        val speedBar = SeekBar(this).apply {
+            max = 250
+            progress = 85
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val speed = 0.5f + (progress / 100f)
+                    KvmState.pointerSpeed = speed
+                    speedLabel.text = "Velocidade da seta no Escravo: ${String.format("%.2f", speed)}x"
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+        root.addView(speedBar)
 
         val btnShizuku = Button(this).apply {
             text = "1. Autorizar Shizuku (Obrigatório no Escravo)"
@@ -106,13 +128,13 @@ class MainActivity : AppCompatActivity() {
                     statusText.text = if (KvmState.isMasterMode)
                         "MESTRE ATIVO (IP: ${KvmService.getLocalIpAddress()})"
                     else
-                        "ESCRAVO ATIVO - Digite este IP no Mestre: ${KvmService.getLocalIpAddress()}"
+                        "ESCRAVO ATIVO - IP: ${KvmService.getLocalIpAddress()}"
                 } else {
                     stopService(Intent(this@MainActivity, KvmService::class.java))
                     KvmState.isRunning = false
                     text = "INICIAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#1B5E20"))
-                    statusText.text = "IP deste aparelho: ${KvmService.getLocalIpAddress()}"
+                    statusText.text = "IP local: ${KvmService.getLocalIpAddress()}"
                 }
             }
         }
@@ -155,7 +177,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showManualIpDialog(edge: Edge) {
         val input = EditText(this).apply {
-            hint = "Ex: 192.168.1.45"
+            hint = "Ex: 192.168.1.101"
             inputType = InputType.TYPE_CLASS_PHONE
         }
         AlertDialog.Builder(this)
@@ -165,7 +187,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Salvar") { _, _ ->
                 val ipStr = input.text.toString().trim()
                 if (ipStr.isNotEmpty()) {
-                    Executors.newSingleThreadExecutor().execute {
+                    thread {
                         try {
                             val addr = InetAddress.getByName(ipStr)
                             val peer = PeerDevice("Manual ($ipStr)", addr, KvmState.UDP_PORT)
@@ -175,7 +197,7 @@ class MainActivity : AppCompatActivity() {
                                 edgeButtons[edge]?.text = "${edge.label}: $ipStr"
                                 Toast.makeText(this, "Conectado ao IP $ipStr!", Toast.LENGTH_SHORT).show()
                             }
-                        } catch (e: Exception) {
+                        } catch (_: Exception) {
                             runOnUiThread {
                                 Toast.makeText(this, "IP inválido!", Toast.LENGTH_SHORT).show()
                             }
