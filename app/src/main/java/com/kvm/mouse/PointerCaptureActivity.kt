@@ -34,7 +34,6 @@ class PointerCaptureActivity : Activity() {
         }
         window.setDimAmount(0f)
 
-        // Alpha 2/255 (invisivel a olho nu, mas obriga o SurfaceFlinger da One UI a dar foco e prender o cursor nativo)
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(2, 0, 0, 0))
         }

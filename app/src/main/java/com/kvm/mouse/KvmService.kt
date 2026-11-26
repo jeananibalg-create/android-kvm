@@ -52,71 +52,118 @@ class KvmService : Service() {
     private var injector: IInputInjector? = null
     private var udpSocket: DatagramSocket? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var cpuWakeLock: PowerManager.WakeLock? = null
     @Volatile private var running = true
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(6)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(7)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                KvmState.captureActivity?.releaseCaptureWindowOnly()
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    // Fecha a janela de captura para desligar o AMOLED 100%
+                    KvmState.captureActivity?.releaseCaptureWindowOnly()
+                    // Se a seta esta no Escravo, mantem apenas a CPU acordada para o Bluetooth continuar enviando UDP
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                        acquireCpuOnlyWakeLock()
+                    }
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    // Se a seta ainda estiver no Escravo, impede o mouse Bluetooth de acender a tela do Mestre!
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                        mainHandler.postDelayed({
+                            if (KvmState.isRemoteActive) {
+                                try { injector?.setScreenPower(false) } catch (_: Exception) {}
+                            }
+                        }, 40)
+                    }
+                }
             }
         }
     }
 
-    // So atua quando a tela esta APAGADA ou BLOQUEADA — nunca duplica com a tela desbloqueada
+    private fun acquireCpuOnlyWakeLock() {
+        try {
+            if (cpuWakeLock == null) {
+                cpuWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AndroidKVM:CpuBluetoothLock")
+            }
+            if (cpuWakeLock?.isHeld == false) {
+                cpuWakeLock?.acquire(4 * 60 * 60 * 1000L)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseCpuWakeLock() {
+        try {
+            if (cpuWakeLock?.isHeld == true) {
+                cpuWakeLock?.release()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun isScreenLockedOrOff(): Boolean {
         return !powerManager.isInteractive || keyguardManager.isKeyguardLocked
     }
 
     private val hwCallback = object : IMouseEventCallback.Stub() {
         override fun onMouseDelta(dx: Float, dy: Float) {
-            if (!KvmState.isMasterMode || !isScreenLockedOrOff()) return
-            val (w, h) = getFullScreenBounds()
-            if (!KvmState.isRemoteActive) {
-                virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
-                virtualMasterY = (virtualMasterY + dy).coerceIn(0f, h)
+            if (!KvmState.isMasterMode) return
 
-                val crossedEdge = when {
-                    virtualMasterX >= w - 2f && KvmState.edgeAssignments[Edge.RIGHT] != null -> Edge.RIGHT
-                    virtualMasterX <= 2f && KvmState.edgeAssignments[Edge.LEFT] != null -> Edge.LEFT
-                    virtualMasterY <= 2f && KvmState.edgeAssignments[Edge.TOP] != null -> Edge.TOP
-                    virtualMasterY >= h - 2f && KvmState.edgeAssignments[Edge.BOTTOM] != null -> Edge.BOTTOM
-                    else -> null
-                }
-                if (crossedEdge != null) {
-                    val peer = KvmState.edgeAssignments[crossedEdge] ?: return
-                    val ratio = when (crossedEdge) {
-                        Edge.LEFT, Edge.RIGHT -> (virtualMasterY / h).coerceIn(0f, 1f)
-                        Edge.TOP, Edge.BOTTOM -> (virtualMasterX / w).coerceIn(0f, 1f)
+            // Opera via hardware quando a tela do Mestre esta bloqueada ou apagada (ou sem janela de captura)
+            if (isScreenLockedOrOff() || (KvmState.isRemoteActive && KvmState.captureActivity == null)) {
+                val (w, h) = getFullScreenBounds()
+                if (!KvmState.isRemoteActive) {
+                    virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
+                    virtualMasterY = (virtualMasterY + dy).coerceIn(0f, h)
+
+                    val crossedEdge = when {
+                        virtualMasterX >= w - 2f && KvmState.edgeAssignments[Edge.RIGHT] != null -> Edge.RIGHT
+                        virtualMasterX <= 2f && KvmState.edgeAssignments[Edge.LEFT] != null -> Edge.LEFT
+                        virtualMasterY <= 2f && KvmState.edgeAssignments[Edge.TOP] != null -> Edge.TOP
+                        virtualMasterY >= h - 2f && KvmState.edgeAssignments[Edge.BOTTOM] != null -> Edge.BOTTOM
+                        else -> null
                     }
-                    KvmState.activeEdge = crossedEdge
-                    KvmState.activePeer = peer
-                    KvmState.isRemoteActive = true
-                    UdpFastSender.sendEnter(peer, crossedEdge, ratio)
+                    if (crossedEdge != null) {
+                        val peer = KvmState.edgeAssignments[crossedEdge] ?: return
+                        val ratio = when (crossedEdge) {
+                            Edge.LEFT, Edge.RIGHT -> (virtualMasterY / h).coerceIn(0f, 1f)
+                            Edge.TOP, Edge.BOTTOM -> (virtualMasterX / w).coerceIn(0f, 1f)
+                        }
+                        KvmState.activeEdge = crossedEdge
+                        KvmState.activePeer = peer
+                        KvmState.isRemoteActive = true
+                        acquireCpuOnlyWakeLock()
+                        UdpFastSender.sendEnter(peer, crossedEdge, ratio)
+                    }
+                } else {
+                    val peer = KvmState.activePeer ?: return
+                    UdpFastSender.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
                 }
-            } else {
-                val peer = KvmState.activePeer ?: return
-                UdpFastSender.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
             }
         }
 
         override fun onMouseButton(action: Int, button: Int) {
-            if (!KvmState.isMasterMode || !KvmState.isRemoteActive || !isScreenLockedOrOff()) return
-            val peer = KvmState.activePeer ?: return
-            if (button == MotionEvent.BUTTON_TERTIARY && action == MotionEvent.ACTION_DOWN) {
-                UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
-            } else {
-                UdpFastSender.sendButton(peer, action, button)
+            if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
+            if (isScreenLockedOrOff() || KvmState.captureActivity == null) {
+                val peer = KvmState.activePeer ?: return
+                if (button == MotionEvent.BUTTON_TERTIARY && action == MotionEvent.ACTION_DOWN) {
+                    UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
+                } else {
+                    UdpFastSender.sendButton(peer, action, button)
+                }
             }
         }
 
         override fun onMouseScroll(vScroll: Float) {
-            if (!KvmState.isMasterMode || !KvmState.isRemoteActive || !isScreenLockedOrOff()) return
-            val peer = KvmState.activePeer ?: return
-            UdpFastSender.sendScroll(peer, vScroll, 0f)
+            if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
+            if (isScreenLockedOrOff() || KvmState.captureActivity == null) {
+                val peer = KvmState.activePeer ?: return
+                UdpFastSender.sendScroll(peer, vScroll, 0f)
+            }
         }
     }
 
@@ -154,7 +201,11 @@ class KvmService : Service() {
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
-        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        registerReceiver(screenReceiver, filter)
 
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("kvm_lock").apply {
@@ -187,7 +238,7 @@ class KvmService : Service() {
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v2.4 Ativo")
+            .setContentTitle("Android KVM v2.5 Ativo")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
@@ -249,6 +300,8 @@ class KvmService : Service() {
                                 )
                             }
                             startActivity(intent)
+                        } else {
+                            acquireCpuOnlyWakeLock()
                         }
                     }
                 }
@@ -429,14 +482,20 @@ class KvmService : Service() {
             KvmState.PKT_RETURN -> {
                 val (w, h) = getFullScreenBounds()
                 when (KvmState.activeEdge) {
-                    Edge.RIGHT -> virtualMasterX = w - 30f
-                    Edge.LEFT -> virtualMasterX = 30f
-                    Edge.TOP -> virtualMasterY = 30f
-                    Edge.BOTTOM -> virtualMasterY = h - 30f
+                    Edge.RIGHT -> virtualMasterX = w - 40f
+                    Edge.LEFT -> virtualMasterX = 40f
+                    Edge.TOP -> virtualMasterY = 40f
+                    Edge.BOTTOM -> virtualMasterY = h - 40f
                     null -> {}
                 }
                 KvmState.isRemoteActive = false
+                releaseCpuWakeLock()
                 KvmState.captureActivity?.releaseAndClose()
+
+                // Agora sim: como a seta voltou para o Mestre, acende a tela do Mestre se estava apagada
+                if (!powerManager.isInteractive) {
+                    try { injector?.setScreenPower(true) } catch (_: Exception) {}
+                }
             }
         }
     }
@@ -457,6 +516,7 @@ class KvmService : Service() {
 
     override fun onDestroy() {
         running = false
+        releaseCpuWakeLock()
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         udpSocket?.close()
         try { multicastLock?.release() } catch (_: Exception) {}

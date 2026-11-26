@@ -3,6 +3,7 @@ package com.kvm.mouse
 import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.KeyCharacterMap
@@ -52,7 +53,28 @@ class InputInjectorService : IInputInjector.Stub() {
         override fun run() {
             if (monitoringHardware) {
                 scanInputDevices()
-                handler.postDelayed(this, 4000)
+                handler.postDelayed(this, 2500)
+            }
+        }
+    }
+
+    override fun setScreenPower(on: Boolean) {
+        val now = SystemClock.uptimeMillis()
+        try {
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val currentApp = activityThreadClass.getMethod("currentApplication").invoke(null) as android.content.Context
+            val pm = currentApp.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager
+            if (on) {
+                val wakeMethod = PowerManager::class.java.getMethod("wakeUp", Long::class.javaPrimitiveType)
+                wakeMethod.invoke(pm, now)
+            } else {
+                val sleepMethod = PowerManager::class.java.getMethod("goToSleep", Long::class.javaPrimitiveType)
+                sleepMethod.invoke(pm, now)
+            }
+        } catch (_: Exception) {
+            try {
+                Runtime.getRuntime().exec(arrayOf("input", "keyevent", if (on) "224" else "223"))
+            } catch (_: Exception) {
             }
         }
     }
@@ -62,7 +84,7 @@ class InputInjectorService : IInputInjector.Stub() {
         if (monitoringHardware) return
         monitoringHardware = true
         scanInputDevices()
-        handler.postDelayed(rescanRunnable, 4000)
+        handler.postDelayed(rescanRunnable, 2500)
     }
 
     private fun scanInputDevices() {
@@ -86,14 +108,19 @@ class InputInjectorService : IInputInjector.Stub() {
     private fun readEvdevLoop(file: File) {
         try {
             FileInputStream(file).use { fis ->
+                // Android 64-bit usa struct input_event de 24 bytes (8+8+2+2+4)
                 val buf = ByteArray(24)
                 val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                 var accX = 0f
                 var accY = 0f
 
                 while (monitoringHardware) {
-                    val read = fis.read(buf)
-                    if (read < 24) break
+                    var offset = 0
+                    while (offset < 24) {
+                        val r = fis.read(buf, offset, 24 - offset)
+                        if (r <= 0) return
+                        offset += r
+                    }
                     bb.rewind()
                     bb.long // tv_sec
                     bb.long // tv_usec
@@ -104,15 +131,19 @@ class InputInjectorService : IInputInjector.Stub() {
                     when (type) {
                         0x02 -> { // EV_REL
                             when (code) {
-                                0x00 -> accX += value.toFloat()
-                                0x01 -> accY += value.toFloat()
-                                0x08 -> {
+                                0x00 -> accX += value.toFloat() // REL_X
+                                0x01 -> accY += value.toFloat() // REL_Y
+                                0x08 -> { // REL_WHEEL
                                     try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
                                 }
                             }
                         }
                         0x01 -> { // EV_KEY
-                            val action = if (value == 1) MotionEvent.ACTION_DOWN else if (value == 0) MotionEvent.ACTION_UP else -1
+                            val action = when (value) {
+                                1 -> MotionEvent.ACTION_DOWN
+                                0 -> MotionEvent.ACTION_UP
+                                else -> -1
+                            }
                             if (action != -1) {
                                 val btn = when (code) {
                                     0x110 -> MotionEvent.BUTTON_PRIMARY
