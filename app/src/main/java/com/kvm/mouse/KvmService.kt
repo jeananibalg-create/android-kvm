@@ -11,18 +11,18 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.view.Display
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.ImageView
 import androidx.core.app.NotificationCompat
 import rikka.shizuku.Shizuku
 import java.net.DatagramPacket
@@ -31,19 +31,24 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.nio.ByteBuffer
 import kotlin.concurrent.thread
+import kotlin.math.roundToInt
 
 class KvmService : Service() {
     private lateinit var wm: WindowManager
     private lateinit var powerManager: PowerManager
     private lateinit var keyguardManager: KeyguardManager
+    private lateinit var displayManager: DisplayManager
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val edgeViews = mutableListOf<View>()
-    private var cursorView: ImageView? = null
-    private var cursorParams: WindowManager.LayoutParams? = null
 
-    private var curX = 300f
-    private var curY = 600f
+    // Rastreamento relativo da posicao no Escravo (considerando tela do celular + monitor externo Samsung DeX)
+    private var relX = 0f
+    private var relY = 0f
+    private var totalSlaveWidth = 1080f
+    private var totalSlaveHeight = 2340f
+    private var slaveButtonsMask = 0
+
     private var virtualMasterX = 500f
     private var virtualMasterY = 1000f
     private var entryEdge: Edge? = null
@@ -57,21 +62,18 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(7)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(8)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
-                    // Fecha a janela de captura para desligar o AMOLED 100%
                     KvmState.captureActivity?.releaseCaptureWindowOnly()
-                    // Se a seta esta no Escravo, mantem apenas a CPU acordada para o Bluetooth continuar enviando UDP
                     if (KvmState.isMasterMode && KvmState.isRemoteActive) {
                         acquireCpuOnlyWakeLock()
                     }
                 }
                 Intent.ACTION_SCREEN_ON -> {
-                    // Se a seta ainda estiver no Escravo, impede o mouse Bluetooth de acender a tela do Mestre!
                     if (KvmState.isMasterMode && KvmState.isRemoteActive) {
                         mainHandler.postDelayed({
                             if (KvmState.isRemoteActive) {
@@ -113,7 +115,6 @@ class KvmService : Service() {
         override fun onMouseDelta(dx: Float, dy: Float) {
             if (!KvmState.isMasterMode) return
 
-            // Opera via hardware quando a tela do Mestre esta bloqueada ou apagada (ou sem janela de captura)
             if (isScreenLockedOrOff() || (KvmState.isRemoteActive && KvmState.captureActivity == null)) {
                 val (w, h) = getFullScreenBounds()
                 if (!KvmState.isRemoteActive) {
@@ -150,11 +151,7 @@ class KvmService : Service() {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
             if (isScreenLockedOrOff() || KvmState.captureActivity == null) {
                 val peer = KvmState.activePeer ?: return
-                if (button == MotionEvent.BUTTON_TERTIARY && action == MotionEvent.ACTION_DOWN) {
-                    UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
-                } else {
-                    UdpFastSender.sendButton(peer, action, button)
-                }
+                UdpFastSender.sendButton(peer, action, button)
             }
         }
 
@@ -172,6 +169,9 @@ class KvmService : Service() {
             injector = IInputInjector.Stub.asInterface(service)
             if (KvmState.isMasterMode) {
                 try { injector?.startHardwareMouseMonitor(hwCallback) } catch (_: Exception) {}
+            } else {
+                // Prepara o driver HID de Mouse Bluetooth nativo no kernel do Escravo
+                try { injector?.createVirtualMouse() } catch (_: Exception) {}
             }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -200,6 +200,7 @@ class KvmService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
@@ -221,7 +222,6 @@ class KvmService : Service() {
             setupMasterEdgeTriggers()
             startDiscoveryLoop()
         } else {
-            setupSlaveCursorOverlay()
             startBeaconLoop()
         }
     }
@@ -231,6 +231,30 @@ class KvmService : Service() {
         return Pair(bounds.width().toFloat(), bounds.height().toFloat())
     }
 
+    // Soma a largura/altura de todas as telas ativas no Escravo (tela interna + monitor externo do Samsung DeX)
+    private fun updateTotalSlaveWorkspace() {
+        var sumW = 0f
+        var maxH = 0f
+        val displays = displayManager.displays
+        for (d in displays) {
+            if (d.state != Display.STATE_OFF) {
+                val mode = d.mode
+                sumW += mode.physicalWidth.toFloat()
+                if (mode.physicalHeight > maxH) {
+                    maxH = mode.physicalHeight.toFloat()
+                }
+            }
+        }
+        if (sumW > 0f && maxH > 0f) {
+            totalSlaveWidth = sumW
+            totalSlaveHeight = maxH
+        } else {
+            val (w, h) = getFullScreenBounds()
+            totalSlaveWidth = w
+            totalSlaveHeight = h
+        }
+    }
+
     private fun startForegroundNotification() {
         val channelId = "kvm_channel"
         val manager = getSystemService(NotificationManager::class.java)
@@ -238,7 +262,7 @@ class KvmService : Service() {
             NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW)
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v2.5 Ativo")
+            .setContentTitle("Android KVM v3.0 (Mouse HID Nativo)")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
@@ -310,30 +334,6 @@ class KvmService : Service() {
             wm.addView(view, params)
             edgeViews.add(view)
         }
-    }
-
-    private fun setupSlaveCursorOverlay() {
-        val img = ImageView(this).apply {
-            setImageResource(R.drawable.ic_cursor)
-            visibility = View.GONE
-        }
-        val params = WindowManager.LayoutParams(
-            44, 44,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            gravity = Gravity.TOP or Gravity.START
-            x = curX.toInt()
-            y = curY.toInt()
-        }
-        wm.addView(img, params)
-        cursorView = img
-        cursorParams = params
     }
 
     private fun startBeaconLoop() {
@@ -410,7 +410,7 @@ class KvmService : Service() {
                     masterAddress = sender
                     val fromEdge = Edge.fromId(buf.get()) ?: Edge.RIGHT
                     val ratio = buf.getFloat().coerceIn(0f, 1f)
-                    val (w, h) = getFullScreenBounds()
+                    updateTotalSlaveWorkspace()
 
                     entryEdge = when (fromEdge) {
                         Edge.RIGHT -> Edge.LEFT
@@ -419,64 +419,113 @@ class KvmService : Service() {
                         Edge.BOTTOM -> Edge.TOP
                     }
 
+                    // Cria o mouse HID Bluetooth real no kernel do Escravo (faz a seta nativa da Samsung aparecer!)
+                    try { injector?.createVirtualMouse() } catch (_: Exception) {}
+
+                    // Encosta o cursor nativo na borda exata de entrada empurrando para o canto correspondente
                     when (entryEdge) {
-                        Edge.LEFT -> { curX = 18f; curY = ratio * h }
-                        Edge.RIGHT -> { curX = w - 18f; curY = ratio * h }
-                        Edge.TOP -> { curX = ratio * w; curY = 18f }
-                        Edge.BOTTOM -> { curX = ratio * w; curY = h - 18f }
+                        Edge.LEFT -> {
+                            relX = 16f
+                            relY = ratio * totalSlaveHeight
+                            try {
+                                injector?.sendVirtualMouseDelta(-4000, -4000)
+                                injector?.sendVirtualMouseDelta(16, (ratio * totalSlaveHeight).roundToInt())
+                            } catch (_: Exception) {}
+                        }
+                        Edge.RIGHT -> {
+                            relX = totalSlaveWidth - 16f
+                            relY = ratio * totalSlaveHeight
+                            try {
+                                injector?.sendVirtualMouseDelta(4000, -4000)
+                                injector?.sendVirtualMouseDelta(-16, (ratio * totalSlaveHeight).roundToInt())
+                            } catch (_: Exception) {}
+                        }
+                        Edge.TOP -> {
+                            relX = ratio * totalSlaveWidth
+                            relY = 16f
+                            try {
+                                injector?.sendVirtualMouseDelta(-4000, -4000)
+                                injector?.sendVirtualMouseDelta((ratio * totalSlaveWidth).roundToInt(), 16)
+                            } catch (_: Exception) {}
+                        }
+                        Edge.BOTTOM -> {
+                            relX = ratio * totalSlaveWidth
+                            relY = totalSlaveHeight - 16f
+                            try {
+                                injector?.sendVirtualMouseDelta(-4000, 4000)
+                                injector?.sendVirtualMouseDelta((ratio * totalSlaveWidth).roundToInt(), -16)
+                            } catch (_: Exception) {}
+                        }
                         null -> {}
                     }
-                    updateCursorUi(visible = true)
-                    injector?.injectMove(curX, curY)
                 }
             }
             KvmState.PKT_MOVE -> {
                 if (length >= 9) {
                     val dx = buf.getFloat()
                     val dy = buf.getFloat()
-                    val (w, h) = getFullScreenBounds()
 
-                    curX += dx
-                    curY += dy
+                    relX += dx
+                    relY += dy
 
                     val crossedBack = when (entryEdge) {
-                        Edge.LEFT -> curX < -12f
-                        Edge.RIGHT -> curX > w + 12f
-                        Edge.TOP -> curY < -12f
-                        Edge.BOTTOM -> curY > h + 12f
+                        Edge.LEFT -> relX < -15f
+                        Edge.RIGHT -> relX > totalSlaveWidth + 15f
+                        Edge.TOP -> relY < -15f
+                        Edge.BOTTOM -> relY > totalSlaveHeight + 15f
                         null -> false
                     }
 
                     if (crossedBack && masterAddress != null) {
-                        updateCursorUi(visible = false)
+                        // Desconecta o mouse virtual HID para a seta nativa sumir imediatamente da tela escrava/DeX
+                        try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
                         UdpFastSender.sendReturn(masterAddress!!)
                         return
                     }
 
-                    curX = curX.coerceIn(0f, w - 1f)
-                    curY = curY.coerceIn(0f, h - 1f)
-                    updateCursorUi(visible = true)
-                    injector?.injectMove(curX, curY)
+                    relX = relX.coerceIn(0f, totalSlaveWidth)
+                    relY = relY.coerceIn(0f, totalSlaveHeight)
+
+                    try {
+                        injector?.sendVirtualMouseDelta(dx.roundToInt(), dy.roundToInt())
+                    } catch (_: Exception) {}
                 }
             }
             KvmState.PKT_BTN -> {
                 if (length >= 9) {
                     val action = buf.getInt()
                     val btn = buf.getInt()
-                    injector?.injectButton(action, curX, curY, btn)
+                    val bit = when (btn) {
+                        MotionEvent.BUTTON_PRIMARY -> 0x01
+                        MotionEvent.BUTTON_SECONDARY -> 0x02
+                        MotionEvent.BUTTON_TERTIARY -> 0x04
+                        else -> 0x01
+                    }
+                    slaveButtonsMask = if (action == MotionEvent.ACTION_DOWN) {
+                        slaveButtonsMask or bit
+                    } else {
+                        slaveButtonsMask and bit.inv()
+                    }
+                    try {
+                        injector?.sendVirtualMouseButton(slaveButtonsMask)
+                    } catch (_: Exception) {}
                 }
             }
             KvmState.PKT_SCROLL -> {
                 if (length >= 9) {
                     val v = buf.getFloat()
-                    val h = buf.getFloat()
-                    injector?.injectScroll(curX, curY, v, h)
+                    val wheelStep = if (v > 0f) 1 else if (v < 0f) -1 else 0
+                    if (wheelStep != 0) {
+                        try {
+                            injector?.sendVirtualMouseScroll(wheelStep)
+                        } catch (_: Exception) {}
+                    }
                 }
             }
             KvmState.PKT_KEY -> {
                 if (length >= 5) {
                     val keyCode = buf.getInt()
-                    injector?.injectKey(keyCode)
+                    try { injector?.injectKey(keyCode) } catch (_: Exception) {}
                 }
             }
             KvmState.PKT_RETURN -> {
@@ -492,23 +541,8 @@ class KvmService : Service() {
                 releaseCpuWakeLock()
                 KvmState.captureActivity?.releaseAndClose()
 
-                // Agora sim: como a seta voltou para o Mestre, acende a tela do Mestre se estava apagada
                 if (!powerManager.isInteractive) {
                     try { injector?.setScreenPower(true) } catch (_: Exception) {}
-                }
-            }
-        }
-    }
-
-    private fun updateCursorUi(visible: Boolean) {
-        mainHandler.post {
-            cursorView?.visibility = if (visible) View.VISIBLE else View.GONE
-            if (visible && cursorParams != null) {
-                cursorParams?.x = curX.toInt()
-                cursorParams?.y = curY.toInt()
-                try {
-                    wm.updateViewLayout(cursorView, cursorParams)
-                } catch (_: Exception) {
                 }
             }
         }
@@ -521,7 +555,7 @@ class KvmService : Service() {
         udpSocket?.close()
         try { multicastLock?.release() } catch (_: Exception) {}
         edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
-        cursorView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
         try { injector?.stopHardwareMouseMonitor() } catch (_: Exception) {}
         try { Shizuku.unbindUserService(userServiceArgs, shizukuConnection, true) } catch (_: Exception) {}
         super.onDestroy()

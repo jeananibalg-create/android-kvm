@@ -107,7 +107,7 @@ class PointerCaptureActivity : Activity() {
                         UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_SECONDARY)
                     }
                     (pressed and MotionEvent.BUTTON_TERTIARY) != 0 -> {
-                        UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
+                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_TERTIARY)
                     }
                     (pressed and MotionEvent.BUTTON_PRIMARY) != 0 || event.buttonState == 0 -> {
                         UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_PRIMARY)
@@ -117,10 +117,16 @@ class PointerCaptureActivity : Activity() {
             MotionEvent.ACTION_UP, MotionEvent.ACTION_BUTTON_RELEASE -> {
                 val released = lastButtonState and event.buttonState.inv()
                 lastButtonState = event.buttonState
-                if ((released and MotionEvent.BUTTON_SECONDARY) != 0) {
-                    UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_SECONDARY)
-                } else {
-                    UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_PRIMARY)
+                when {
+                    (released and MotionEvent.BUTTON_SECONDARY) != 0 -> {
+                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_SECONDARY)
+                    }
+                    (released and MotionEvent.BUTTON_TERTIARY) != 0 -> {
+                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_TERTIARY)
+                    }
+                    else -> {
+                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_PRIMARY)
+                    }
                 }
             }
             MotionEvent.ACTION_SCROLL -> {

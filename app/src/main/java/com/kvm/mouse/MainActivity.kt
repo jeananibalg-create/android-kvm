@@ -34,7 +34,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v2.5"
+            text = "Android KVM v3.0 (Mouse HID Nativo)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -50,7 +50,7 @@ class MainActivity : AppCompatActivity() {
 
         val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val btnMaster = Button(this).apply { text = "MESTRE (Mouse aqui)" }
-        val btnSlave = Button(this).apply { text = "ESCRAVO (Recebe seta)" }
+        val btnSlave = Button(this).apply { text = "ESCRAVO (Mouse BT Nativo)" }
         modeRow.addView(btnMaster, LinearLayout.LayoutParams(0, -2, 1f))
         modeRow.addView(btnSlave, LinearLayout.LayoutParams(0, -2, 1f))
         root.addView(modeRow)
@@ -94,13 +94,13 @@ class MainActivity : AppCompatActivity() {
         root.addView(speedBar)
 
         val btnShizuku = Button(this).apply {
-            text = "1. Autorizar Shizuku (Mestre e Escravo)"
+            text = "1. Autorizar Shizuku (Obrigatório em ambos)"
             setOnClickListener { requestShizukuPerm() }
         }
         root.addView(btnShizuku)
 
         val btnOverlay = Button(this).apply {
-            text = "2. Permitir Sobrepor Apps (Mestre e Escravo)"
+            text = "2. Permitir Sobrepor Apps (Mestre)"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -128,7 +128,7 @@ class MainActivity : AppCompatActivity() {
                     statusText.text = if (KvmState.isMasterMode)
                         "MESTRE ATIVO (IP: ${KvmService.getLocalIpAddress()})"
                     else
-                        "ESCRAVO ATIVO - IP: ${KvmService.getLocalIpAddress()}"
+                        "ESCRAVO HID ATIVO - IP: ${KvmService.getLocalIpAddress()}"
                 } else {
                     stopService(Intent(this@MainActivity, KvmService::class.java))
                     KvmState.isRunning = false

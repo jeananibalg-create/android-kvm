@@ -11,6 +11,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
@@ -29,24 +30,139 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private var downTime = 0L
-    private var isLeftPressed = false
-    private var isRightPressed = false
-    private var rightLongPressTriggered = false
-    private var lastX = 0f
-    private var lastY = 0f
+    private var uhidOut: FileOutputStream? = null
+    private var currentButtonsMask = 0
 
     @Volatile private var monitoringHardware = false
     private var hwCallback: IMouseEventCallback? = null
     private val activeReaders = mutableSetOf<String>()
 
-    private val rightLongPressRunnable = Runnable {
-        if (isRightPressed) {
-            rightLongPressTriggered = true
-            val now = SystemClock.uptimeMillis()
-            downTime = now
-            dispatchTouch(downTime, now, MotionEvent.ACTION_DOWN, lastX, lastY, 1.0f)
+    // Descritor HID padrao de Mouse 3 botoes + Rodinha (reconhecido nativamente pelo Android/One UI/Samsung DeX)
+    private val mouseHidDescriptor = byteArrayOf(
+        0x05, 0x01,       // Usage Page (Generic Desktop)
+        0x09, 0x02,       // Usage (Mouse)
+        0xA1.toByte(), 0x01, // Collection (Application)
+        0x09, 0x01,       //   Usage (Pointer)
+        0xA1.toByte(), 0x00, //   Collection (Physical)
+        0x05, 0x09,       //     Usage Page (Button)
+        0x19, 0x01,       //     Usage Minimum (Button 1)
+        0x29, 0x03,       //     Usage Maximum (Button 3)
+        0x15, 0x00,       //     Logical Minimum (0)
+        0x25, 0x01,       //     Logical Maximum (1)
+        0x95.toByte(), 0x03, //     Report Count (3)
+        0x75, 0x01,       //     Report Size (1)
+        0x81.toByte(), 0x02, //     Input (Data, Variable, Absolute)
+        0x95.toByte(), 0x01, //     Report Count (1)
+        0x75, 0x05,       //     Report Size (5)
+        0x81.toByte(), 0x03, //     Input (Constant)
+        0x05, 0x01,       //     Usage Page (Generic Desktop)
+        0x09, 0x30,       //     Usage (X)
+        0x09, 0x31,       //     Usage (Y)
+        0x09, 0x38,       //     Usage (Wheel)
+        0x15, 0x81.toByte(), //     Logical Minimum (-127)
+        0x25, 0x7F,       //     Logical Maximum (127)
+        0x75, 0x08,       //     Report Size (8)
+        0x95.toByte(), 0x03, //     Report Count (3)
+        0x81.toByte(), 0x06, //     Input (Data, Variable, Relative)
+        0xC0.toByte(),       //   End Collection
+        0xC0.toByte()        // End Collection
+    )
+
+    @Synchronized
+    override fun createVirtualMouse() {
+        if (uhidOut != null) return
+        try {
+            val fos = FileOutputStream(File("/dev/uhid"))
+            // struct uhid_event para UHID_CREATE2 (type = 11):
+            // uint32 type (4) + name[128] + phys[64] + uniq[64] + uint16 rd_size (2) + uint16 bus (2)
+            // + uint32 vendor (4) + uint32 product (4) + uint32 version (4) + uint32 country (4) + rd_data[4096]
+            val totalSize = 4 + 128 + 64 + 64 + 2 + 2 + 4 + 4 + 4 + 4 + 4096
+            val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
+
+            buf.putInt(11) // UHID_CREATE2
+            val nameBytes = "Samsung Bluetooth Mouse KVM".toByteArray(Charsets.UTF_8)
+            buf.put(nameBytes)
+            buf.position(4 + 128 + 64 + 64)
+
+            buf.putShort(mouseHidDescriptor.size.toShort())
+            buf.putShort(0x05) // BUS_BLUETOOTH (Android/Samsung trata como mouse Bluetooth nativo!)
+            buf.putInt(0x04E8) // Samsung Vendor ID
+            buf.putInt(0x7021) // Samsung Bluetooth Mouse Product ID
+            buf.putInt(0x0100) // Version
+            buf.putInt(0)      // Country
+            buf.put(mouseHidDescriptor)
+
+            fos.write(buf.array())
+            fos.flush()
+            uhidOut = fos
+            currentButtonsMask = 0
+        } catch (_: Exception) {
+            uhidOut = null
         }
+    }
+
+    @Synchronized
+    override fun destroyVirtualMouse() {
+        val fos = uhidOut ?: return
+        try {
+            // UHID_DESTROY = 1
+            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array()
+            fos.write(buf)
+            fos.flush()
+            fos.close()
+        } catch (_: Exception) {
+        } finally {
+            uhidOut = null
+            currentButtonsMask = 0
+        }
+    }
+
+    @Synchronized
+    private fun writeHidReport(buttons: Int, dx: Int, dy: Int, wheel: Int) {
+        val fos = uhidOut ?: return
+        try {
+            // Quebra movimentos maiores que 127px em multiplos pacotes HID de 8 bits com sinal
+            var remX = dx
+            var remY = dy
+            var first = true
+            while (first || remX != 0 || remY != 0) {
+                first = false
+                val stepX = remX.coerceIn(-127, 127)
+                val stepY = remY.coerceIn(-127, 127)
+                remX -= stepX
+                remY -= stepY
+
+                // struct uhid_event para UHID_INPUT2 (type = 12):
+                // uint32 type (4) + uint16 size (2) + uint8 data[4096]
+                val buf = ByteBuffer.allocate(4 + 2 + 4).order(ByteOrder.LITTLE_ENDIAN)
+                buf.putInt(12) // UHID_INPUT2
+                buf.putShort(4) // 4 bytes de relatorio HID: [buttons, dx, dy, wheel]
+                buf.put((buttons and 0x07).toByte())
+                buf.put(stepX.toByte())
+                buf.put(stepY.toByte())
+                buf.put(wheel.coerceIn(-127, 127).toByte())
+                fos.write(buf.array())
+            }
+            fos.flush()
+        } catch (_: Exception) {
+            uhidOut = null
+        }
+    }
+
+    override fun sendVirtualMouseDelta(dx: Int, dy: Int) {
+        if (uhidOut == null) createVirtualMouse()
+        writeHidReport(currentButtonsMask, dx, dy, 0)
+    }
+
+    override fun sendVirtualMouseButton(buttonMask: Int) {
+        if (uhidOut == null) createVirtualMouse()
+        currentButtonsMask = buttonMask
+        writeHidReport(currentButtonsMask, 0, 0, 0)
+    }
+
+    override fun sendVirtualMouseScroll(wheel: Int) {
+        if (uhidOut == null) createVirtualMouse()
+        writeHidReport(currentButtonsMask, 0, 0, wheel)
     }
 
     private val rescanRunnable = object : Runnable {
@@ -108,7 +224,6 @@ class InputInjectorService : IInputInjector.Stub() {
     private fun readEvdevLoop(file: File) {
         try {
             FileInputStream(file).use { fis ->
-                // Android 64-bit usa struct input_event de 24 bytes (8+8+2+2+4)
                 val buf = ByteArray(24)
                 val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
                 var accX = 0f
@@ -131,9 +246,9 @@ class InputInjectorService : IInputInjector.Stub() {
                     when (type) {
                         0x02 -> { // EV_REL
                             when (code) {
-                                0x00 -> accX += value.toFloat() // REL_X
-                                0x01 -> accY += value.toFloat() // REL_Y
-                                0x08 -> { // REL_WHEEL
+                                0x00 -> accX += value.toFloat()
+                                0x01 -> accY += value.toFloat()
+                                0x08 -> {
                                     try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
                                 }
                             }
@@ -176,63 +291,6 @@ class InputInjectorService : IInputInjector.Stub() {
         hwCallback = null
     }
 
-    override fun injectMove(x: Float, y: Float) {
-        lastX = x
-        lastY = y
-        val now = SystemClock.uptimeMillis()
-        when {
-            isLeftPressed -> dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
-            rightLongPressTriggered -> dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
-            else -> dispatchMouseHover(now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0f, 0f)
-        }
-    }
-
-    override fun injectButton(action: Int, x: Float, y: Float, buttonState: Int) {
-        lastX = x
-        lastY = y
-        val now = SystemClock.uptimeMillis()
-
-        if (buttonState == MotionEvent.BUTTON_SECONDARY) {
-            if (action == MotionEvent.ACTION_DOWN) {
-                isRightPressed = true
-                rightLongPressTriggered = false
-                handler.removeCallbacks(rightLongPressRunnable)
-                handler.postDelayed(rightLongPressRunnable, 320)
-            } else if (action == MotionEvent.ACTION_UP) {
-                handler.removeCallbacks(rightLongPressRunnable)
-                if (rightLongPressTriggered) {
-                    val dTime = if (downTime > 0L) downTime else now
-                    dispatchTouch(dTime, now, MotionEvent.ACTION_UP, x, y, 0.0f)
-                    downTime = 0L
-                } else if (isRightPressed) {
-                    injectKey(KeyEvent.KEYCODE_BACK)
-                }
-                isRightPressed = false
-                rightLongPressTriggered = false
-            }
-            return
-        }
-
-        if (action == MotionEvent.ACTION_DOWN) {
-            downTime = now
-            isLeftPressed = true
-            dispatchTouch(downTime, now, MotionEvent.ACTION_DOWN, x, y, 1.0f)
-        } else if (action == MotionEvent.ACTION_UP) {
-            val dTime = if (downTime > 0L) downTime else now
-            dispatchTouch(dTime, now, MotionEvent.ACTION_UP, x, y, 0.0f)
-            isLeftPressed = false
-            downTime = 0L
-        }
-    }
-
-    override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float) {
-        lastX = x
-        lastY = y
-        val now = SystemClock.uptimeMillis()
-        dispatchMouseHover(now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0f, 0f)
-        dispatchMouseHover(now, MotionEvent.ACTION_SCROLL, x, y, vScroll * 2.5f, hScroll * 2.5f)
-    }
-
     override fun injectKey(keyCode: Int) {
         val now = SystemClock.uptimeMillis()
         try {
@@ -244,68 +302,9 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
-    private fun dispatchTouch(
-        dTime: Long,
-        eTime: Long,
-        action: Int,
-        x: Float,
-        y: Float,
-        pressureVal: Float
-    ) {
-        try {
-            val props = arrayOf(MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_FINGER
-            })
-            val coords = arrayOf(MotionEvent.PointerCoords().apply {
-                this.x = x
-                this.y = y
-                pressure = pressureVal
-                size = 0.5f
-            })
-            val event = MotionEvent.obtain(
-                dTime, eTime, action, 1, props, coords,
-                0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
-            )
-            injectMethod.invoke(inputManager, event, 0)
-            event.recycle()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun dispatchMouseHover(
-        eTime: Long,
-        action: Int,
-        x: Float,
-        y: Float,
-        vScroll: Float,
-        hScroll: Float
-    ) {
-        try {
-            val props = arrayOf(MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_MOUSE
-            })
-            val coords = arrayOf(MotionEvent.PointerCoords().apply {
-                this.x = x
-                this.y = y
-                pressure = 0.0f
-                size = 1.0f
-                setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
-                setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
-            })
-            val event = MotionEvent.obtain(
-                eTime, eTime, action, 1, props, coords,
-                0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0
-            )
-            injectMethod.invoke(inputManager, event, 0)
-            event.recycle()
-        } catch (_: Exception) {
-        }
-    }
-
     override fun destroy() {
         monitoringHardware = false
+        destroyVirtualMouse()
         handler.removeCallbacksAndMessages(null)
         exitProcess(0)
     }
