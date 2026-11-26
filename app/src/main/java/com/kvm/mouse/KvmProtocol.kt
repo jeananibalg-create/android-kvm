@@ -14,7 +14,7 @@ enum class Edge(val id: Byte, val label: String) {
     BOTTOM(4, "Embaixo");
 
     companion object {
-        fun fromId(id: Byte): Edge? = entries.find { it.id == id }
+        fun fromId(id: Byte): Edge? = values().find { it.id == id }
     }
 }
 
