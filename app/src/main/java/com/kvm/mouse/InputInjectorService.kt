@@ -2,6 +2,7 @@ package com.kvm.mouse
 
 import android.hardware.input.InputManager
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
@@ -25,6 +26,20 @@ class InputInjectorService : IInputInjector.Stub() {
     private val inputManager: InputManager by lazy {
         InputManager::class.java.getMethod("getInstance").invoke(null) as InputManager
     }
+
+    private val systemInputService: Any? by lazy {
+        try {
+            val smClass = Class.forName("android.os.ServiceManager")
+            val getService = smClass.getDeclaredMethod("getService", String::class.java)
+            val binder = getService.invoke(null, "input") as IBinder
+            val stubClass = Class.forName("android.hardware.input.IInputManager\$Stub")
+            val asInterface = stubClass.getDeclaredMethod("asInterface", IBinder::class.java)
+            asInterface.invoke(null, binder)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private val injectMethod by lazy {
         InputManager::class.java.getMethod(
             "injectInputEvent",
@@ -38,10 +53,10 @@ class InputInjectorService : IInputInjector.Stub() {
     private var currentButtonsMask = 0
 
     @Volatile private var monitoringHardware = false
-    @Volatile private var isGrabbed = false
+    @Volatile private var isSilenced = false
     private var hwCallback: IMouseEventCallback? = null
     private val openMouseFds = ConcurrentHashMap<String, FileDescriptor>()
-    private val openMousePaths = ConcurrentHashMap<String, String>()
+    private val disabledDeviceIds = ConcurrentHashMap<Int, Boolean>()
 
     private val mouseHidDescriptor = byteArrayOf(
         0x05, 0x01,       // Usage Page (Generic Desktop)
@@ -73,6 +88,17 @@ class InputInjectorService : IInputInjector.Stub() {
         0xC0.toByte()        // End Collection
     )
 
+    private fun unlockHiddenApis() {
+        try {
+            val vmRuntimeClass = Class.forName("dalvik.system.VMRuntime")
+            val getRuntime = vmRuntimeClass.getDeclaredMethod("getRuntime")
+            val setExemptions = vmRuntimeClass.getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
+            val runtime = getRuntime.invoke(null)
+            setExemptions.invoke(runtime, arrayOf("L"))
+        } catch (_: Exception) {
+        }
+    }
+
     private fun isPhysicalMouseDevice(eventName: String): Boolean {
         try {
             val sysBase = File("/sys/class/input/$eventName/device")
@@ -103,77 +129,35 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
-    // Desbloqueia hidden APIs no processo Shizuku e aplica EVIOCGRAB (0x40044590) diretamente no descritor do mouse
-    private fun unlockHiddenApis() {
-        try {
-            val vmRuntimeClass = Class.forName("dalvik.system.VMRuntime")
-            val getRuntime = vmRuntimeClass.getDeclaredMethod("getRuntime")
-            val setExemptions = vmRuntimeClass.getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
-            val runtime = getRuntime.invoke(null)
-            setExemptions.invoke(runtime, arrayOf("L"))
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun applyIoctlGrab(fd: FileDescriptor, grab: Boolean): Boolean {
+    // Desabilita/habilita o mouse fisico na camada IInputManager do Android para que ele NAO acorde a tela do Mestre
+    // enquanto nosso leitor bruto /dev/input/eventX continua capturando os movimentos normalmente
+    override fun setLocalMouseSilenced(silenced: Boolean) {
         unlockHiddenApis()
-        val EVIOCGRAB = 0x40044590.toInt()
-        val arg = if (grab) 1 else 0
-        try {
-            val ioctlMethod = Os::class.java.getDeclaredMethod(
-                "ioctlInt",
-                FileDescriptor::class.java,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType
-            )
-            ioctlMethod.isAccessible = true
-            ioctlMethod.invoke(null, fd, EVIOCGRAB, arg)
-            return true
-        } catch (_: Exception) {
-        }
-        try {
-            val libcoreClass = Class.forName("libcore.io.Libcore")
-            val osField = libcoreClass.getDeclaredField("os").apply { isAccessible = true }.get(null)
-            val ioctlMethod = osField.javaClass.getDeclaredMethod(
-                "ioctlInt",
-                FileDescriptor::class.java,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType
-            )
-            ioctlMethod.isAccessible = true
-            ioctlMethod.invoke(osField, fd, EVIOCGRAB, arg)
-            return true
-        } catch (_: Exception) {
-        }
-        return false
-    }
+        isSilenced = silenced
+        val svc = systemInputService ?: return
 
-    override fun setMouseGrabbed(grab: Boolean) {
-        isGrabbed = grab
-        openMouseFds.forEach { (name, fd) ->
-            val ok = applyIoctlGrab(fd, grab)
-            // Fallback via InputManager.setInputDeviceEnabled caso o kernel bloqueie ioctl na JVM
-            if (!ok) {
-                setDeviceEnabledViaInputManager(name, !grab)
-            }
-        }
-    }
-
-    private fun setDeviceEnabledViaInputManager(eventName: String, enabled: Boolean) {
         try {
-            val sysNameFile = File("/sys/class/input/$eventName/device/name")
-            val targetName = if (sysNameFile.exists()) sysNameFile.readText().trim() else return
-            val ids = InputDevice.getDeviceIds()
-            for (id in ids) {
-                val dev = InputDevice.getDevice(id) ?: continue
-                if (dev.name == targetName) {
-                    val m = InputManager::class.java.getDeclaredMethod(
-                        if (enabled) "enableInputDevice" else "disableInputDevice",
-                        Int::class.javaPrimitiveType
-                    )
-                    m.isAccessible = true
-                    m.invoke(inputManager, id)
+            if (silenced) {
+                val ids = InputDevice.getDeviceIds()
+                val disableMethod = svc.javaClass.getDeclaredMethod("disableInputDevice", Int::class.javaPrimitiveType).apply {
+                    isAccessible = true
                 }
+                for (id in ids) {
+                    val dev = InputDevice.getDevice(id) ?: continue
+                    val isMouse = (dev.sources and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+                    if (isMouse && !dev.name.contains("KVM", ignoreCase = true)) {
+                        disableMethod.invoke(svc, id)
+                        disabledDeviceIds[id] = true
+                    }
+                }
+            } else {
+                val enableMethod = svc.javaClass.getDeclaredMethod("enableInputDevice", Int::class.javaPrimitiveType).apply {
+                    isAccessible = true
+                }
+                disabledDeviceIds.keys.forEach { id ->
+                    try { enableMethod.invoke(svc, id) } catch (_: Exception) {}
+                }
+                disabledDeviceIds.clear()
             }
         } catch (_: Exception) {
         }
@@ -277,7 +261,10 @@ class InputInjectorService : IInputInjector.Stub() {
         override fun run() {
             if (monitoringHardware) {
                 scanMouseDevicesOnly()
-                handler.postDelayed(this, 3000)
+                if (isSilenced) {
+                    setLocalMouseSilenced(true)
+                }
+                handler.postDelayed(this, 2500)
             }
         }
     }
@@ -305,7 +292,7 @@ class InputInjectorService : IInputInjector.Stub() {
         if (monitoringHardware) return
         monitoringHardware = true
         scanMouseDevicesOnly()
-        handler.postDelayed(rescanRunnable, 3000)
+        handler.postDelayed(rescanRunnable, 2500)
     }
 
     private fun scanMouseDevicesOnly() {
@@ -325,11 +312,6 @@ class InputInjectorService : IInputInjector.Stub() {
         try {
             fd = Os.open(file.absolutePath, OsConstants.O_RDONLY, 0)
             openMouseFds[file.name] = fd
-            openMousePaths[file.name] = file.absolutePath
-            if (isGrabbed) {
-                val ok = applyIoctlGrab(fd, true)
-                if (!ok) setDeviceEnabledViaInputManager(file.name, false)
-            }
 
             FileInputStream(fd).use { fis ->
                 val buf = ByteArray(24)
@@ -392,9 +374,7 @@ class InputInjectorService : IInputInjector.Stub() {
         } catch (_: Exception) {
         } finally {
             openMouseFds.remove(file.name)
-            openMousePaths.remove(file.name)
             if (fd != null) {
-                try { applyIoctlGrab(fd, false) } catch (_: Exception) {}
                 try { Os.close(fd) } catch (_: Exception) {}
             }
         }
@@ -402,15 +382,12 @@ class InputInjectorService : IInputInjector.Stub() {
 
     override fun stopHardwareMouseMonitor() {
         monitoringHardware = false
-        isGrabbed = false
+        setLocalMouseSilenced(false)
         handler.removeCallbacks(rescanRunnable)
-        openMouseFds.forEach { (name, fd) ->
-            try { applyIoctlGrab(fd, false) } catch (_: Exception) {}
-            try { setDeviceEnabledViaInputManager(name, true) } catch (_: Exception) {}
+        openMouseFds.values.forEach { fd ->
             try { Os.close(fd) } catch (_: Exception) {}
         }
         openMouseFds.clear()
-        openMousePaths.clear()
         hwCallback = null
     }
 

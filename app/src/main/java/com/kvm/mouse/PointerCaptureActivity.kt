@@ -96,7 +96,7 @@ class PointerCaptureActivity : Activity() {
                 dx += event.x
                 dy += event.y
                 if (dx != 0f || dy != 0f) {
-                    UdpFastSender.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
+                    HybridTransport.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
                 }
             }
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_BUTTON_PRESS -> {
@@ -104,13 +104,13 @@ class PointerCaptureActivity : Activity() {
                 lastButtonState = event.buttonState
                 when {
                     (pressed and MotionEvent.BUTTON_SECONDARY) != 0 -> {
-                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_SECONDARY)
+                        HybridTransport.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_SECONDARY)
                     }
                     (pressed and MotionEvent.BUTTON_TERTIARY) != 0 -> {
-                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_TERTIARY)
+                        HybridTransport.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_TERTIARY)
                     }
                     (pressed and MotionEvent.BUTTON_PRIMARY) != 0 || event.buttonState == 0 -> {
-                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_PRIMARY)
+                        HybridTransport.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_PRIMARY)
                     }
                 }
             }
@@ -119,13 +119,13 @@ class PointerCaptureActivity : Activity() {
                 lastButtonState = event.buttonState
                 when {
                     (released and MotionEvent.BUTTON_SECONDARY) != 0 -> {
-                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_SECONDARY)
+                        HybridTransport.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_SECONDARY)
                     }
                     (released and MotionEvent.BUTTON_TERTIARY) != 0 -> {
-                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_TERTIARY)
+                        HybridTransport.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_TERTIARY)
                     }
                     else -> {
-                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_PRIMARY)
+                        HybridTransport.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_PRIMARY)
                     }
                 }
             }
@@ -133,7 +133,7 @@ class PointerCaptureActivity : Activity() {
                 val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
                 val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
                 if (v != 0f || h != 0f) {
-                    UdpFastSender.sendScroll(peer, v, h)
+                    HybridTransport.sendScroll(peer, v, h)
                 }
             }
         }

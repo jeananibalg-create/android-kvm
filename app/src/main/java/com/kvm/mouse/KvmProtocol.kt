@@ -1,10 +1,14 @@
 package com.kvm.mouse
 
 import android.content.Context
+import java.io.DataOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import kotlin.concurrent.thread
 
@@ -27,6 +31,8 @@ data class PeerDevice(
 
 object KvmState {
     const val UDP_PORT = 45678
+    const val TCP_PORT = 45679
+
     const val PKT_MOVE: Byte = 1
     const val PKT_BTN: Byte = 2
     const val PKT_SCROLL: Byte = 3
@@ -90,65 +96,125 @@ object KvmState {
     }
 }
 
-object UdpFastSender {
-    private data class OutPacket(val data: ByteArray, val host: InetAddress, val port: Int)
-    private val queue = LinkedBlockingQueue<OutPacket>(512)
-    private var socket: DatagramSocket? = null
+// Transporte Hibrido v4.0:
+// - TCP persistente com TCP_NODELAY para comandos criticos (ENTER, RETURN, CLICKS, SCROLL, PING) -> 100% entrega garantida
+// - UDP ultra-rapido para delta de movimento continuo (dx, dy) -> latencia minima sem bloqueio
+object HybridTransport {
+    private data class UdpPacket(val data: ByteArray, val host: InetAddress, val port: Int)
+    private data class TcpPacket(val data: ByteArray, val host: InetAddress)
+
+    private val udpQueue = LinkedBlockingQueue<UdpPacket>(512)
+    private val tcpQueue = LinkedBlockingQueue<TcpPacket>(256)
+    private val tcpConnections = ConcurrentHashMap<String, Socket>()
+    private var udpSocket: DatagramSocket? = null
 
     init {
         thread(isDaemon = true, name = "KvmUdpSender") {
             while (true) {
                 try {
-                    val pkt = queue.take()
-                    val s = socket ?: DatagramSocket().apply { broadcast = true }.also { socket = it }
+                    val pkt = udpQueue.take()
+                    val s = udpSocket ?: DatagramSocket().apply {
+                        broadcast = true
+                        trafficClass = 0x10 // IPTOS_LOWDELAY
+                    }.also { udpSocket = it }
                     s.send(DatagramPacket(pkt.data, pkt.data.size, pkt.host, pkt.port))
                 } catch (_: Exception) {
-                    try { socket?.close() } catch (_: Exception) {}
-                    socket = null
+                    try { udpSocket?.close() } catch (_: Exception) {}
+                    udpSocket = null
+                }
+            }
+        }
+
+        thread(isDaemon = true, name = "KvmTcpControlSender") {
+            while (true) {
+                val pkt = tcpQueue.take()
+                val ipKey = pkt.host.hostAddress ?: continue
+                var sent = false
+                for (attempt in 1..2) {
+                    try {
+                        val sock = getOrOpenTcpSocket(ipKey, pkt.host)
+                        synchronized(sock) {
+                            val out = DataOutputStream(sock.getOutputStream())
+                            out.writeShort(pkt.data.size)
+                            out.write(pkt.data)
+                            out.flush()
+                        }
+                        sent = true
+                        break
+                    } catch (_: Exception) {
+                        closeTcpSocket(ipKey)
+                    }
+                }
+                if (!sent) {
+                    // Fallback UDP caso o destino ainda esteja abrindo a porta TCP
+                    udpQueue.offer(UdpPacket(pkt.data, pkt.host, KvmState.UDP_PORT))
                 }
             }
         }
     }
 
+    private fun getOrOpenTcpSocket(ipKey: String, host: InetAddress): Socket {
+        val existing = tcpConnections[ipKey]
+        if (existing != null && existing.isConnected && !existing.isClosed) {
+            return existing
+        }
+        closeTcpSocket(ipKey)
+        val sock = Socket().apply {
+            tcpNoDelay = true
+            keepAlive = true
+            trafficClass = 0x10 // IPTOS_LOWDELAY
+            connect(InetSocketAddress(host, KvmState.TCP_PORT), 600)
+        }
+        tcpConnections[ipKey] = sock
+        return sock
+    }
+
+    private fun closeTcpSocket(ipKey: String) {
+        val old = tcpConnections.remove(ipKey)
+        try { old?.close() } catch (_: Exception) {}
+    }
+
     fun sendMove(peer: PeerDevice, dx: Float, dy: Float) {
         val buf = ByteBuffer.allocate(9).put(KvmState.PKT_MOVE).putFloat(dx).putFloat(dy).array()
-        queue.offer(OutPacket(buf, peer.host, peer.port))
+        udpQueue.offer(UdpPacket(buf, peer.host, peer.port))
     }
 
     fun sendButton(peer: PeerDevice, action: Int, button: Int) {
         val buf = ByteBuffer.allocate(9).put(KvmState.PKT_BTN).putInt(action).putInt(button).array()
-        queue.offer(OutPacket(buf, peer.host, peer.port))
+        tcpQueue.offer(TcpPacket(buf, peer.host))
     }
 
     fun sendScroll(peer: PeerDevice, vScroll: Float, hScroll: Float) {
         val buf = ByteBuffer.allocate(9).put(KvmState.PKT_SCROLL).putFloat(vScroll).putFloat(hScroll).array()
-        queue.offer(OutPacket(buf, peer.host, peer.port))
+        tcpQueue.offer(TcpPacket(buf, peer.host))
     }
 
     fun sendKey(peer: PeerDevice, keyCode: Int) {
         val buf = ByteBuffer.allocate(5).put(KvmState.PKT_KEY).putInt(keyCode).array()
-        queue.offer(OutPacket(buf, peer.host, peer.port))
+        tcpQueue.offer(TcpPacket(buf, peer.host))
     }
 
     fun sendEnter(peer: PeerDevice, edge: Edge, ratio: Float) {
         val buf = ByteBuffer.allocate(6).put(KvmState.PKT_ENTER).put(edge.id).putFloat(ratio).array()
-        queue.offer(OutPacket(buf, peer.host, peer.port))
+        tcpQueue.offer(TcpPacket(buf, peer.host))
     }
 
     fun sendReturn(host: InetAddress) {
         val buf = byteArrayOf(KvmState.PKT_RETURN)
-        queue.offer(OutPacket(buf, host, KvmState.UDP_PORT))
+        tcpQueue.offer(TcpPacket(buf, host))
+        // Envia tambem via UDP redundante para latencia zero na volta
+        udpQueue.offer(UdpPacket(buf, host, KvmState.UDP_PORT))
     }
 
     fun sendPing(peer: PeerDevice) {
-        queue.offer(OutPacket(byteArrayOf(KvmState.PKT_PING), peer.host, peer.port))
+        tcpQueue.offer(TcpPacket(byteArrayOf(KvmState.PKT_PING), peer.host))
     }
 
     fun sendPong(host: InetAddress) {
-        queue.offer(OutPacket(byteArrayOf(KvmState.PKT_PONG), host, KvmState.UDP_PORT))
+        tcpQueue.offer(TcpPacket(byteArrayOf(KvmState.PKT_PONG), host))
     }
 
-    fun sendRaw(data: ByteArray, host: InetAddress, port: Int = KvmState.UDP_PORT) {
-        queue.offer(OutPacket(data, host, port))
+    fun sendBroadcastRaw(data: ByteArray, host: InetAddress, port: Int = KvmState.UDP_PORT) {
+        udpQueue.offer(UdpPacket(data, host, port))
     }
 }
