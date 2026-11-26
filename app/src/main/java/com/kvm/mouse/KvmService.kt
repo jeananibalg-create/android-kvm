@@ -295,10 +295,10 @@ class KvmService : Service() {
                 }
 
                 when (entryEdge) {
-                    Edge.LEFT -> { curX = 5f; curY = ratio * screenH }
-                    Edge.RIGHT -> { curX = screenW - 5f; curY = ratio * screenH }
-                    Edge.TOP -> { curX = ratio * screenW; curY = 5f }
-                    Edge.BOTTOM -> { curX = ratio * screenW; curY = screenH - 5f }
+                    Edge.LEFT -> { curX = 25f; curY = ratio * screenH }
+                    Edge.RIGHT -> { curX = screenW - 25f; curY = ratio * screenH }
+                    Edge.TOP -> { curX = ratio * screenW; curY = 25f }
+                    Edge.BOTTOM -> { curX = ratio * screenW; curY = screenH - 25f }
                     null -> {}
                 }
                 updateCursorUi(visible = true)
@@ -310,10 +310,10 @@ class KvmService : Service() {
                 curY += dy
 
                 val crossedBack = when (entryEdge) {
-                    Edge.LEFT -> curX < 0f
-                    Edge.RIGHT -> curX > screenW
-                    Edge.TOP -> curY < 0f
-                    Edge.BOTTOM -> curY > screenH
+                    Edge.LEFT -> curX < -15f
+                    Edge.RIGHT -> curX > screenW + 15f
+                    Edge.TOP -> curY < -15f
+                    Edge.BOTTOM -> curY > screenH + 15f
                     null -> false
                 }
 
