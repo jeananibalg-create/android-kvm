@@ -7,5 +7,6 @@ object NativeEvdev {
 
     external fun openDevice(path: String): Int
     external fun grabDevice(fd: Int, grab: Boolean): Int
+    external fun readEvent(fd: Int, outArr: LongArray): Int
     external fun closeDevice(fd: Int)
 }

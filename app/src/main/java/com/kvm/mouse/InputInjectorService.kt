@@ -3,7 +3,6 @@ package com.kvm.mouse
 import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.Looper
-import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.InputDevice
@@ -11,7 +10,6 @@ import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -71,38 +69,45 @@ class InputInjectorService : IInputInjector.Stub() {
         0xC0.toByte()        // End Collection
     )
 
+    private fun hasKernelBit(hexWords: String, bit: Int): Boolean {
+        val parts = hexWords.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (parts.isEmpty()) return false
+        val wordBits = 64
+        val wordIndexFromEnd = bit / wordBits
+        val bitInWord = bit % wordBits
+        val idx = parts.size - 1 - wordIndexFromEnd
+        if (idx < 0 || idx >= parts.size) return false
+        val wordVal = java.lang.Long.parseUnsignedLong(parts[idx], 16)
+        return ((wordVal ushr bitInWord) and 1L) == 1L
+    }
+
+    // Identifica qualquer mouse USB/Bluetooth real: precisa ter REL_X (0), REL_Y (1) e BTN_LEFT (0x110 = 272)
     private fun isPhysicalMouseDevice(eventName: String): Boolean {
         try {
             val sysBase = File("/sys/class/input/$eventName/device")
             val nameFile = File(sysBase, "name")
             val devName = if (nameFile.exists()) nameFile.readText().trim().lowercase() else ""
-            if (devName.contains("kvm") || devName.contains("multi control") || devName.contains("touch") || devName.contains("sensor") || devName.contains("gpio")) {
+            if (devName.contains("kvm") || devName.contains("multi control") || devName.contains("touchscreen")) {
                 return false
             }
 
             val relFile = File(sysBase, "capabilities/rel")
-            val absFile = File(sysBase, "capabilities/abs")
             val keyFile = File(sysBase, "capabilities/key")
             if (!relFile.exists() || !keyFile.exists()) return false
 
             val relHex = relFile.readText().trim()
-            if (relHex.isEmpty() || relHex == "0") return false
+            val keyHex = keyFile.readText().trim()
 
-            val lastRelWord = relHex.split(" ").last().toLongOrNull(16) ?: 0L
-            val hasRelXY = (lastRelWord and 0x03L) == 0x03L
-            if (!hasRelXY) return false
+            val hasRelX = hasKernelBit(relHex, 0x00)
+            val hasRelY = hasKernelBit(relHex, 0x01)
+            val hasBtnLeft = hasKernelBit(keyHex, 0x110)
 
-            val absHex = if (absFile.exists()) absFile.readText().trim() else "0"
-            if (absHex != "0" && absHex.isNotEmpty()) return false
-
-            return true
+            return hasRelX && hasRelY && hasBtnLeft
         } catch (_: Exception) {
             return false
         }
     }
 
-    // Executa EVIOCGRAB real via C/JNI no kernel Linux:
-    // O mouse entrega eventos APENAS para nosso processo e NADA para o Android/One UI do Mestre!
     override fun setKernelMouseGrab(grab: Boolean) {
         isGrabbed = grab
         openNativeFds.values.forEach { rawFd ->
@@ -224,7 +229,7 @@ class InputInjectorService : IInputInjector.Stub() {
         override fun run() {
             if (monitoringHardware) {
                 scanMouseDevicesOnly()
-                handler.postDelayed(this, 2500)
+                handler.postDelayed(this, 2000)
             }
         }
     }
@@ -251,7 +256,7 @@ class InputInjectorService : IInputInjector.Stub() {
         if (monitoringHardware) return
         monitoringHardware = true
         scanMouseDevicesOnly()
-        handler.postDelayed(rescanRunnable, 2500)
+        handler.postDelayed(rescanRunnable, 2000)
     }
 
     private fun scanMouseDevicesOnly() {
@@ -274,63 +279,52 @@ class InputInjectorService : IInputInjector.Stub() {
             NativeEvdev.grabDevice(rawFd, true)
         }
 
-        var pfd: ParcelFileDescriptor? = null
+        val evData = LongArray(3)
+        var accX = 0f
+        var accY = 0f
+
         try {
-            pfd = ParcelFileDescriptor.adoptFd(rawFd)
-            FileInputStream(pfd.fileDescriptor).use { fis ->
-                val buf = ByteArray(24)
-                val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
-                var accX = 0f
-                var accY = 0f
+            while (monitoringHardware) {
+                val res = NativeEvdev.readEvent(rawFd, evData)
+                if (res <= 0) break
 
-                while (monitoringHardware) {
-                    var offset = 0
-                    while (offset < 24) {
-                        val r = fis.read(buf, offset, 24 - offset)
-                        if (r <= 0) return
-                        offset += r
+                val type = evData[0].toInt()
+                val code = evData[1].toInt()
+                val value = evData[2].toInt()
+
+                when (type) {
+                    0x02 -> { // EV_REL
+                        when (code) {
+                            0x00 -> accX += value.toFloat()
+                            0x01 -> accY += value.toFloat()
+                            0x08 -> {
+                                try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
+                            }
+                        }
                     }
-                    bb.rewind()
-                    bb.long
-                    bb.long
-                    val type = bb.short.toInt() and 0xFFFF
-                    val code = bb.short.toInt() and 0xFFFF
-                    val value = bb.int
-
-                    when (type) {
-                        0x02 -> { // EV_REL
-                            when (code) {
-                                0x00 -> accX += value.toFloat()
-                                0x01 -> accY += value.toFloat()
-                                0x08 -> {
-                                    try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
-                                }
+                    0x01 -> { // EV_KEY
+                        val action = when (value) {
+                            1 -> MotionEvent.ACTION_DOWN
+                            0 -> MotionEvent.ACTION_UP
+                            else -> -1
+                        }
+                        if (action != -1) {
+                            val btn = when (code) {
+                                0x110 -> MotionEvent.BUTTON_PRIMARY
+                                0x111 -> MotionEvent.BUTTON_SECONDARY
+                                0x112 -> MotionEvent.BUTTON_TERTIARY
+                                else -> 0
+                            }
+                            if (btn != 0) {
+                                try { hwCallback?.onMouseButton(action, btn) } catch (_: Exception) {}
                             }
                         }
-                        0x01 -> { // EV_KEY
-                            val action = when (value) {
-                                1 -> MotionEvent.ACTION_DOWN
-                                0 -> MotionEvent.ACTION_UP
-                                else -> -1
-                            }
-                            if (action != -1) {
-                                val btn = when (code) {
-                                    0x110 -> MotionEvent.BUTTON_PRIMARY
-                                    0x111 -> MotionEvent.BUTTON_SECONDARY
-                                    0x112 -> MotionEvent.BUTTON_TERTIARY
-                                    else -> 0
-                                }
-                                if (btn != 0) {
-                                    try { hwCallback?.onMouseButton(action, btn) } catch (_: Exception) {}
-                                }
-                            }
-                        }
-                        0x00 -> { // EV_SYN
-                            if (accX != 0f || accY != 0f) {
-                                try { hwCallback?.onMouseDelta(accX, accY) } catch (_: Exception) {}
-                                accX = 0f
-                                accY = 0f
-                            }
+                    }
+                    0x00 -> { // EV_SYN
+                        if (accX != 0f || accY != 0f) {
+                            try { hwCallback?.onMouseDelta(accX, accY) } catch (_: Exception) {}
+                            accX = 0f
+                            accY = 0f
                         }
                     }
                 }
@@ -338,8 +332,7 @@ class InputInjectorService : IInputInjector.Stub() {
         } catch (_: Exception) {
         } finally {
             openNativeFds.remove(file.name)
-            try { NativeEvdev.grabDevice(rawFd, false) } catch (_: Exception) {}
-            try { pfd?.close() } catch (_: Exception) {}
+            try { NativeEvdev.closeDevice(rawFd) } catch (_: Exception) {}
         }
     }
 

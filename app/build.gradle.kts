@@ -11,8 +11,8 @@ android {
         applicationId = "com.kvm.mouse"
         minSdk = 30
         targetSdk = 34
-        versionCode = 16
-        versionName = "6.0"
+        versionCode = 17
+        versionName = "6.1"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
