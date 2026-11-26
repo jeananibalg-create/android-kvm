@@ -1,300 +1,211 @@
 package com.kvm.mouse
 
+import android.Manifest
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
-import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import rikka.shizuku.Shizuku
 import java.net.InetAddress
-import kotlin.concurrent.thread
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    private lateinit var ipText: TextView
     private lateinit var statusText: TextView
+    private lateinit var btnMaster: Button
+    private lateinit var btnSlave: Button
+    private lateinit var edgesBox: LinearLayout
+    private lateinit var slaveHint: TextView
+    private lateinit var btnOverlay: Button
+    private lateinit var btnToggle: Button
     private val edgeButtons = mutableMapOf<Edge, Button>()
-    private val uiHandler = Handler(Looper.getMainLooper())
 
-    private val statusRefresher = object : Runnable {
-        override fun run() {
-            val ip = KvmService.getLocalIpAddress()
-            val shizukuStr = if (KvmState.shizukuConnected) "Shizuku: OK" else "Shizuku: Desconectado"
-            statusText.text = if (KvmState.isRunning) {
-                if (KvmState.isMasterMode) {
-                    "MESTRE ATIVO | IP: $ip\n$shizukuStr | Mouses HW: ${KvmState.detectedMouseCount}"
-                } else {
-                    "ESCRAVO ATIVO | IP: $ip\n$shizukuStr | UHID Virtual: Pronto"
-                }
-            } else {
-                "Parado | IP: $ip | $shizukuStr"
-            }
-            uiHandler.postDelayed(this, 1000)
-        }
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun text(value: String, size: Float, color: Int = Color.WHITE) = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(color)
+    }
+
+    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        isAllCaps = false
+        setOnClickListener { onClick() }
+    }
+
+    private fun LinearLayout.put(v: View, top: Int = 12) {
+        addView(v, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(top) })
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        KvmState.loadConfig(this)
 
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.BLACK)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
         }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
-            setPadding(48, 56, 48, 56)
+            setPadding(dp(20), dp(40), dp(20), dp(24))
         }
-        scroll.addView(root)
 
-        val title = TextView(this).apply {
-            text = "Android KVM v6.2"
-            textSize = 22f
-            setTextColor(Color.WHITE)
-        }
-        root.addView(title)
-
-        statusText = TextView(this).apply {
-            text = "IP local: ${KvmService.getLocalIpAddress()}"
-            textSize = 14f
-            setTextColor(Color.GREEN)
-            setPadding(0, 10, 0, 20)
-        }
-        root.addView(statusText)
+        root.put(text("Android KVM 3.1", 24f), 0)
+        ipText = text("", 14f, Color.rgb(102, 187, 106))
+        root.put(ipText, 4)
+        statusText = text("", 13f, Color.LTGRAY)
+        root.put(statusText, 8)
 
         val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val btnMaster = Button(this).apply { text = "MESTRE (Mouse aqui)" }
-        val btnSlave = Button(this).apply { text = "ESCRAVO (Mouse BT Nativo)" }
+        btnMaster = button("Mestre (mouse aqui)") { KvmState.isMaster.value = true }
+        btnSlave = button("Escravo (recebe a seta)") { KvmState.isMaster.value = false }
         modeRow.addView(btnMaster, LinearLayout.LayoutParams(0, -2, 1f))
         modeRow.addView(btnSlave, LinearLayout.LayoutParams(0, -2, 1f))
-        root.addView(modeRow)
+        root.put(modeRow, 16)
 
-        val lockSwitch = Switch(this).apply {
-            text = "Funcionar na Tela de Bloqueio (Multi Control)"
-            setTextColor(Color.CYAN)
-            isChecked = KvmState.allowLockscreenControl
-            setPadding(0, 24, 0, 12)
-            setOnCheckedChangeListener { _, isChecked ->
-                KvmState.allowLockscreenControl = isChecked
-                KvmState.saveConfig(this@MainActivity)
-                if (KvmState.isRunning) {
-                    startForegroundService(Intent(this@MainActivity, KvmService::class.java))
-                }
-                Toast.makeText(
-                    this@MainActivity,
-                    if (isChecked) "Modo Tela de Bloqueio ATIVADO" else "Modo Tela de Bloqueio DESATIVADO",
-                    Toast.LENGTH_SHORT
-                ).show()
+        edgesBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        edgesBox.put(text("Celulares escravos nas bordas:", 14f), 0)
+        Edge.entries.forEach { edge ->
+            val b = button("") { pickPeer(edge) }
+            edgeButtons[edge] = b
+            edgesBox.put(b, 4)
+        }
+        root.put(edgesBox, 16)
+
+        slaveHint = text(
+            "Botão esquerdo, direito (menu/voltar), meio e roda funcionam nativamente: " +
+                "o escravo enxerga um mouse Bluetooth real. No DeX ative \"Fluxo do ponteiro para a tela do telefone\".",
+            12f, Color.GRAY
+        )
+        root.put(slaveHint, 16)
+
+        root.put(button("1. Autorizar Shizuku (Mestre e Escravo)") { requestShizuku() }, 16)
+        btnOverlay = button("2. Permitir sobrepor apps (Mestre)") {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        }
+        root.put(btnOverlay, 8)
+
+        btnToggle = button("") {
+            if (!KvmState.running.value && !Settings.canDrawOverlays(this) && KvmState.isMaster.value) {
+                toast("Ative \"Sobrepor apps\" primeiro")
+                return@button
             }
+            val i = Intent(this, KvmService::class.java)
+            if (KvmState.running.value) stopService(i) else startForegroundService(i)
         }
-        root.addView(lockSwitch)
+        btnToggle.setTextColor(Color.WHITE)
+        root.put(btnToggle, 20)
 
-        val edgesLabel = TextView(this).apply {
-            text = "\nPosição dos celulares escravos (Modo Mestre):"
-            setTextColor(Color.WHITE)
-            setPadding(0, 12, 0, 8)
-        }
-        root.addView(edgesLabel)
+        setContentView(ScrollView(this).apply { addView(root) })
 
-        Edge.values().forEach { edge ->
-            val savedPeer = KvmState.edgeAssignments[edge]
-            val btn = Button(this).apply {
-                text = "${edge.label}: ${savedPeer?.name ?: "Nenhum"}"
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                setOnClickListener { showPeerSelector(edge) }
-            }
-            edgeButtons[edge] = btn
-            root.addView(btn)
+        scope.launch {
+            combine(
+                KvmState.isMaster, KvmState.running, KvmState.edges, KvmState.status, KvmState.shizuku
+            ) { _, _, _, _, _ -> }.collect { render() }
         }
+    }
 
-        val speedLabel = TextView(this).apply {
-            text = "\nVelocidade da seta no Escravo: ${String.format("%.2f", KvmState.pointerSpeed)}x"
-            setTextColor(Color.LTGRAY)
-        }
-        root.addView(speedLabel)
-
-        val speedBar = SeekBar(this).apply {
-            max = 250
-            progress = ((KvmState.pointerSpeed - 0.5f) * 100f).toInt().coerceIn(0, 250)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    val speed = 0.5f + (progress / 100f)
-                    KvmState.pointerSpeed = speed
-                    KvmState.saveConfig(this@MainActivity)
-                    speedLabel.text = "Velocidade da seta no Escravo: ${String.format("%.2f", speed)}x"
-                }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-            })
-        }
-        root.addView(speedBar)
-
-        val btnShizuku = Button(this).apply {
-            text = "1. Autorizar Shizuku (Obrigatório em ambos)"
-            setOnClickListener { requestShizukuPerm() }
-        }
-        root.addView(btnShizuku)
-
-        val btnOverlay = Button(this).apply {
-            text = "2. Permitir Sobrepor Apps (Mestre)"
-            setOnClickListener {
-                if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-                } else {
-                    Toast.makeText(this@MainActivity, "Permissão já concedida!", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-        root.addView(btnOverlay)
-
-        val btnBattery = Button(this).apply {
-            text = "3. Manter em 2º Plano (Sem restrição bateria)"
-            setOnClickListener {
-                val pm = getSystemService(POWER_SERVICE) as PowerManager
-                if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                } else {
-                    Toast.makeText(this@MainActivity, "Já está sem restrição de bateria!", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-        root.addView(btnBattery)
-
-        val btnToggleService = Button(this).apply {
-            text = if (KvmState.isRunning) "PARAR SERVIÇO KVM" else "INICIAR SERVIÇO KVM"
-            setBackgroundColor(Color.parseColor(if (KvmState.isRunning) "#B71C1C" else "#1B5E20"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    Toast.makeText(this@MainActivity, "Ative 'Sobrepor Apps' primeiro!", Toast.LENGTH_LONG).show()
-                    return@setOnClickListener
-                }
-                if (!KvmState.isRunning) {
-                    KvmState.isRunning = true
-                    KvmState.saveConfig(this@MainActivity)
-                    startForegroundService(Intent(this@MainActivity, KvmService::class.java))
-                    text = "PARAR SERVIÇO KVM"
-                    setBackgroundColor(Color.parseColor("#B71C1C"))
-                } else {
-                    KvmState.isRunning = false
-                    KvmState.saveConfig(this@MainActivity)
-                    stopService(Intent(this@MainActivity, KvmService::class.java))
-                    text = "INICIAR SERVIÇO KVM"
-                    setBackgroundColor(Color.parseColor("#1B5E20"))
-                }
-            }
-        }
-        root.addView(btnToggleService)
-
-        btnMaster.setOnClickListener {
-            KvmState.isMasterMode = true
-            KvmState.saveConfig(this)
-        }
-        btnSlave.setOnClickListener {
-            KvmState.isMasterMode = false
-            KvmState.saveConfig(this)
-        }
-
-        setContentView(scroll)
-        uiHandler.post(statusRefresher)
+    override fun onResume() {
+        super.onResume()
+        ipText.text = "IP deste aparelho: ${Net.localIp()}"
+        render()
     }
 
     override fun onDestroy() {
-        uiHandler.removeCallbacks(statusRefresher)
+        scope.cancel()
         super.onDestroy()
     }
 
-    private fun showPeerSelector(edge: Edge) {
-        val peers = KvmState.discoveredPeers.values.toList()
-        val items = (listOf("Nenhum", "+ Digitar IP do Escravo manualmente") + peers.map { it.name }).toTypedArray()
+    private fun render() {
+        val master = KvmState.isMaster.value
+        val running = KvmState.running.value
+        btnMaster.isEnabled = !running
+        btnSlave.isEnabled = !running
+        btnMaster.alpha = if (master) 1f else 0.45f
+        btnSlave.alpha = if (master) 0.45f else 1f
+        edgesBox.visibility = if (master) View.VISIBLE else View.GONE
+        slaveHint.visibility = if (master) View.GONE else View.VISIBLE
+        Edge.entries.forEach {
+            edgeButtons[it]?.text = "${it.label}: ${KvmState.edges.value[it]?.name ?: "Nenhum"}"
+        }
+        btnToggle.text = if (running) "PARAR SERVIÇO" else "INICIAR SERVIÇO"
+        btnToggle.setBackgroundColor(if (running) 0xFFB71C1C.toInt() else 0xFF1B5E20.toInt())
+        btnOverlay.visibility = if (Settings.canDrawOverlays(this)) View.GONE else View.VISIBLE
+        val shizuku = if (KvmState.shizuku.value) "Shizuku: conectado" else "Shizuku: desconectado"
+        statusText.text = listOf(shizuku, KvmState.status.value).filter { it.isNotEmpty() }.joinToString("\n")
+    }
 
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    private fun pickPeer(edge: Edge) {
+        val peers = KvmState.peers.value.values.toList()
+        val items = (listOf("Nenhum", "Digitar IP manualmente…") + peers.map { it.name }).toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("Celular na borda: ${edge.label}")
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> {
-                        KvmState.edgeAssignments[edge] = null
-                        KvmState.saveConfig(this)
-                        edgeButtons[edge]?.text = "${edge.label}: Nenhum"
-                    }
-                    1 -> showManualIpDialog(edge)
-                    else -> {
-                        val chosen = peers[which - 2]
-                        KvmState.edgeAssignments[edge] = chosen
-                        KvmState.saveConfig(this)
-                        edgeButtons[edge]?.text = "${edge.label}: ${chosen.name}"
-                    }
+                    0 -> KvmState.edges.update { it - edge }
+                    1 -> typeIp(edge)
+                    else -> KvmState.edges.update { it + (edge to peers[which - 2]) }
                 }
             }
             .show()
     }
 
-    private fun showManualIpDialog(edge: Edge) {
+    private fun typeIp(edge: Edge) {
         val input = EditText(this).apply {
-            hint = "Ex: 192.168.1.101"
+            hint = "Ex: 192.168.1.45"
             inputType = InputType.TYPE_CLASS_PHONE
         }
         AlertDialog.Builder(this)
-            .setTitle("IP do celular Escravo (${edge.label})")
-            .setMessage("Olhe o IP exibido em verde na tela do celular Escravo:")
+            .setTitle("IP do escravo (${edge.label})")
             .setView(input)
             .setPositiveButton("Salvar") { _, _ ->
-                val ipStr = input.text.toString().trim()
-                if (ipStr.isNotEmpty()) {
-                    thread {
-                        try {
-                            val addr = InetAddress.getByName(ipStr)
-                            val peer = PeerDevice("Manual ($ipStr)", addr, KvmState.UDP_PORT)
-                            KvmState.discoveredPeers[peer.name] = peer
-                            KvmState.edgeAssignments[edge] = peer
-                            KvmState.saveConfig(this)
-                            runOnUiThread {
-                                edgeButtons[edge]?.text = "${edge.label}: $ipStr"
-                                Toast.makeText(this, "Conectado ao IP $ipStr!", Toast.LENGTH_SHORT).show()
-                            }
-                        } catch (_: Exception) {
-                            runOnUiThread {
-                                Toast.makeText(this, "IP inválido!", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
+                val ip = input.text.toString().trim()
+                if (Regex("\\d{1,3}(\\.\\d{1,3}){3}").matches(ip)) {
+                    val peer = PeerDevice("Manual ($ip)", InetAddress.getByName(ip))
+                    KvmState.edges.update { it + (edge to peer) }
+                } else {
+                    toast("IP inválido")
                 }
             }
             .setNegativeButton("Cancelar", null)
             .show()
     }
 
-    private fun requestShizukuPerm() {
+    private fun requestShizuku() {
         try {
-            if (!Shizuku.pingBinder()) {
-                Toast.makeText(this, "Abra o app Shizuku e inicie o serviço primeiro.", Toast.LENGTH_LONG).show()
-                return
+            when {
+                !Shizuku.pingBinder() -> toast("Abra o app Shizuku e inicie o serviço primeiro.")
+                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> toast("Shizuku já autorizado!")
+                else -> Shizuku.requestPermission(1001)
             }
-            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                Shizuku.requestPermission(1001)
-            } else {
-                Toast.makeText(this, "Shizuku já autorizado!", Toast.LENGTH_SHORT).show()
-            }
-        } catch (e: Exception) {
-            Toast.makeText(this, "Erro Shizuku: ${e.message}", Toast.LENGTH_LONG).show()
+        } catch (e: Throwable) {
+            toast("Erro Shizuku: ${e.message}")
         }
     }
 }
