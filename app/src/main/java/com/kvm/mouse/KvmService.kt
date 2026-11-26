@@ -8,8 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.graphics.PixelFormat
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -25,13 +24,14 @@ import rikka.shizuku.Shizuku
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.NetworkInterface
 import java.util.concurrent.Executors
 
 class KvmService : Service() {
     private lateinit var wm: WindowManager
-    private lateinit var nsdManager: NsdManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private val netExecutor = Executors.newSingleThreadExecutor()
+    private val beaconExecutor = Executors.newSingleThreadExecutor()
 
     private val edgeViews = mutableListOf<View>()
     private var cursorView: ImageView? = null
@@ -46,8 +46,8 @@ class KvmService : Service() {
 
     private var injector: IInputInjector? = null
     private var udpSocket: DatagramSocket? = null
-    private var registrationListener: NsdManager.RegistrationListener? = null
-    private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var running = true
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
@@ -75,23 +75,43 @@ class KvmService : Service() {
                 }
             }
         }
+
+        fun getLocalIpAddress(): String {
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                for (intf in interfaces) {
+                    for (addr in intf.inetAddresses) {
+                        if (!addr.isLoopbackAddress && addr.hostAddress?.contains(':') == false) {
+                            return addr.hostAddress ?: ""
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            return "Desconhecido"
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        nsdManager = getSystemService(Context.NSD_SERVICE) as NsdManager
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wifi.createMulticastLock("kvm_lock").apply {
+            setReferenceCounted(true)
+            acquire()
+        }
+
         updateScreenMetrics()
         startForegroundNotification()
         startUdpListener()
 
         if (KvmState.isMasterMode) {
             setupMasterEdgeTriggers()
-            startNsdDiscovery()
+            startDiscoveryPingLoop()
         } else {
             bindShizuku()
             setupSlaveCursorOverlay()
-            registerNsdService()
+            startSlaveBeaconLoop()
         }
     }
 
@@ -111,7 +131,7 @@ class KvmService : Service() {
         )
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Android KVM Ativo")
-            .setContentText(if (KvmState.isMasterMode) "Modo Mestre (Aguardando borda)" else "Modo Escravo (Shizuku)")
+            .setContentText(if (KvmState.isMasterMode) "Modo Mestre (IP: ${getLocalIpAddress()})" else "Modo Escravo (IP: ${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
         startForeground(1, notification)
@@ -127,7 +147,7 @@ class KvmService : Service() {
     }
 
     private fun setupMasterEdgeTriggers() {
-        val thickness = 4
+        val thickness = 6
         Edge.values().forEach { edge ->
             val view = View(this)
             val params = WindowManager.LayoutParams(
@@ -193,12 +213,42 @@ class KvmService : Service() {
         cursorParams = params
     }
 
+    private fun startSlaveBeaconLoop() {
+        beaconExecutor.execute {
+            while (running) {
+                try {
+                    val socket = DatagramSocket().apply { broadcast = true }
+                    val msg = "HELLO_SLAVE:${Build.MODEL}".toByteArray()
+                    socket.send(DatagramPacket(msg, msg.size, InetAddress.getByName("255.255.255.255"), KvmState.UDP_PORT))
+                    socket.close()
+                } catch (_: Exception) {
+                }
+                Thread.sleep(2000)
+            }
+        }
+    }
+
+    private fun startDiscoveryPingLoop() {
+        beaconExecutor.execute {
+            while (running) {
+                try {
+                    val socket = DatagramSocket().apply { broadcast = true }
+                    val msg = "DISCOVER_KVM".toByteArray()
+                    socket.send(DatagramPacket(msg, msg.size, InetAddress.getByName("255.255.255.255"), KvmState.UDP_PORT))
+                    socket.close()
+                } catch (_: Exception) {
+                }
+                Thread.sleep(2000)
+            }
+        }
+    }
+
     private fun startUdpListener() {
         netExecutor.execute {
             try {
-                udpSocket = DatagramSocket(KvmState.UDP_PORT)
+                udpSocket = DatagramSocket(KvmState.UDP_PORT).apply { broadcast = true }
                 val buf = ByteArray(512)
-                while (!Thread.currentThread().isInterrupted) {
+                while (running) {
                     val packet = DatagramPacket(buf, buf.size)
                     udpSocket?.receive(packet)
                     val msg = String(packet.data, 0, packet.length)
@@ -212,6 +262,26 @@ class KvmService : Service() {
     private fun handleUdpMessage(msg: String, sender: InetAddress) {
         val parts = msg.split(":")
         when (parts[0]) {
+            "DISCOVER_KVM" -> {
+                if (!KvmState.isMasterMode) {
+                    sendExecutor.execute {
+                        try {
+                            val reply = "HELLO_SLAVE:${Build.MODEL}".toByteArray()
+                            val s = DatagramSocket()
+                            s.send(DatagramPacket(reply, reply.size, sender, KvmState.UDP_PORT))
+                            s.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+            "HELLO_SLAVE" -> {
+                if (KvmState.isMasterMode) {
+                    val modelName = parts.getOrElse(1) { "Android" }
+                    val label = "$modelName (${sender.hostAddress})"
+                    KvmState.discoveredPeers[label] = PeerDevice(label, sender, KvmState.UDP_PORT)
+                }
+            }
             "ENTER" -> {
                 masterAddress = sender
                 val fromMasterEdge = Edge.valueOf(parts[1])
@@ -301,50 +371,12 @@ class KvmService : Service() {
         }
     }
 
-    private fun registerNsdService() {
-        val serviceInfo = NsdServiceInfo().apply {
-            serviceName = "KVM_${Build.MODEL.replace(" ", "_")}"
-            serviceType = KvmState.SERVICE_TYPE
-            port = KvmState.UDP_PORT
-        }
-        registrationListener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(info: NsdServiceInfo) {}
-            override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
-            override fun onServiceUnregistered(info: NsdServiceInfo) {}
-            override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
-        }
-        nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
-    }
-
-    private fun startNsdDiscovery() {
-        discoveryListener = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(regType: String) {}
-            override fun onServiceFound(service: NsdServiceInfo) {
-                if (service.serviceType.contains("_androidkvm")) {
-                    nsdManager.resolveService(service, object : NsdManager.ResolveListener {
-                        override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {}
-                        override fun onServiceResolved(info: NsdServiceInfo) {
-                            val host = info.host ?: return
-                            val cleanName = info.serviceName.removePrefix("KVM_").replace("_", " ")
-                            KvmState.discoveredPeers[cleanName] = PeerDevice(cleanName, host, info.port)
-                        }
-                    })
-                }
-            }
-            override fun onServiceLost(service: NsdServiceInfo) {}
-            override fun onDiscoveryStopped(serviceType: String) {}
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {}
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
-        }
-        nsdManager.discoverServices(KvmState.SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-    }
-
     override fun onDestroy() {
+        running = false
         udpSocket?.close()
+        try { multicastLock?.release() } catch (_: Exception) {}
         edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
         cursorView?.let { try { wm.removeView(it) } catch (_: Exception) {} }
-        registrationListener?.let { try { nsdManager.unregisterService(it) } catch (_: Exception) {} }
-        discoveryListener?.let { try { nsdManager.stopServiceDiscovery(it) } catch (_: Exception) {} }
         try { Shizuku.unbindUserService(userServiceArgs, shizukuConnection, true) } catch (_: Exception) {}
         super.onDestroy()
     }

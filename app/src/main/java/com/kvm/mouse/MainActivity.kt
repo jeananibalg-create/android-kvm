@@ -7,13 +7,17 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.view.Gravity
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
+import java.net.InetAddress
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
@@ -29,17 +33,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM (Shizuku)"
-            textSize = 24f
+            text = "Android KVM v1.1 (Shizuku)"
+            textSize = 22f
             setTextColor(Color.WHITE)
         }
         root.addView(title)
 
         statusText = TextView(this).apply {
-            text = "Selecione o modo deste aparelho:"
+            text = "IP deste aparelho: ${KvmService.getLocalIpAddress()}"
             textSize = 14f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, 16, 0, 32)
+            setTextColor(Color.GREEN)
+            setPadding(0, 12, 0, 24)
         }
         root.addView(statusText)
 
@@ -53,7 +57,7 @@ class MainActivity : AppCompatActivity() {
         val edgesLabel = TextView(this).apply {
             text = "\nPosição dos celulares escravos (Modo Mestre):"
             setTextColor(Color.WHITE)
-            setPadding(0, 32, 0, 16)
+            setPadding(0, 24, 0, 12)
         }
         root.addView(edgesLabel)
 
@@ -99,13 +103,16 @@ class MainActivity : AppCompatActivity() {
                     KvmState.isRunning = true
                     text = "PARAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#B71C1C"))
-                    statusText.text = if (KvmState.isMasterMode) "MESTRE ATIVO - Encoste o mouse na borda!" else "ESCRAVO ATIVO - Visível no Wi-Fi!"
+                    statusText.text = if (KvmState.isMasterMode)
+                        "MESTRE ATIVO (IP: ${KvmService.getLocalIpAddress()})"
+                    else
+                        "ESCRAVO ATIVO - Digite este IP no Mestre: ${KvmService.getLocalIpAddress()}"
                 } else {
                     stopService(Intent(this@MainActivity, KvmService::class.java))
                     KvmState.isRunning = false
                     text = "INICIAR SERVIÇO KVM"
                     setBackgroundColor(Color.parseColor("#1B5E20"))
-                    statusText.text = "Serviço parado."
+                    statusText.text = "IP deste aparelho: ${KvmService.getLocalIpAddress()}"
                 }
             }
         }
@@ -113,11 +120,11 @@ class MainActivity : AppCompatActivity() {
 
         btnMaster.setOnClickListener {
             KvmState.isMasterMode = true
-            statusText.text = "Modo selecionado: MESTRE"
+            statusText.text = "Modo: MESTRE | IP: ${KvmService.getLocalIpAddress()}"
         }
         btnSlave.setOnClickListener {
             KvmState.isMasterMode = false
-            statusText.text = "Modo selecionado: ESCRAVO"
+            statusText.text = "Modo: ESCRAVO | IP: ${KvmService.getLocalIpAddress()}"
         }
 
         setContentView(root)
@@ -125,23 +132,58 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPeerSelector(edge: Edge) {
         val peers = KvmState.discoveredPeers.values.toList()
-        if (peers.isEmpty()) {
-            Toast.makeText(this, "Inicie o serviço no Mestre e no Escravo no mesmo Wi-Fi primeiro.", Toast.LENGTH_LONG).show()
-            return
-        }
-        val names = (listOf("Nenhum") + peers.map { it.name }).toTypedArray()
+        val items = (listOf("Nenhum", "+ Digitar IP do Escravo manualmente") + peers.map { it.name }).toTypedArray()
+
         AlertDialog.Builder(this)
             .setTitle("Celular na borda: ${edge.label}")
-            .setItems(names) { _, which ->
-                if (which == 0) {
-                    KvmState.edgeAssignments[edge] = null
-                    edgeButtons[edge]?.text = "${edge.label}: Nenhum"
-                } else {
-                    val chosen = peers[which - 1]
-                    KvmState.edgeAssignments[edge] = chosen
-                    edgeButtons[edge]?.text = "${edge.label}: ${chosen.name}"
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> {
+                        KvmState.edgeAssignments[edge] = null
+                        edgeButtons[edge]?.text = "${edge.label}: Nenhum"
+                    }
+                    1 -> showManualIpDialog(edge)
+                    else -> {
+                        val chosen = peers[which - 2]
+                        KvmState.edgeAssignments[edge] = chosen
+                        edgeButtons[edge]?.text = "${edge.label}: ${chosen.name}"
+                    }
                 }
             }
+            .show()
+    }
+
+    private fun showManualIpDialog(edge: Edge) {
+        val input = EditText(this).apply {
+            hint = "Ex: 192.168.1.45"
+            inputType = InputType.TYPE_CLASS_PHONE
+        }
+        AlertDialog.Builder(this)
+            .setTitle("IP do celular Escravo (${edge.label})")
+            .setMessage("Olhe o IP exibido em verde na tela do celular Escravo:")
+            .setView(input)
+            .setPositiveButton("Salvar") { _, _ ->
+                val ipStr = input.text.toString().trim()
+                if (ipStr.isNotEmpty()) {
+                    Executors.newSingleThreadExecutor().execute {
+                        try {
+                            val addr = InetAddress.getByName(ipStr)
+                            val peer = PeerDevice("Manual ($ipStr)", addr, KvmState.UDP_PORT)
+                            KvmState.discoveredPeers[peer.name] = peer
+                            KvmState.edgeAssignments[edge] = peer
+                            runOnUiThread {
+                                edgeButtons[edge]?.text = "${edge.label}: $ipStr"
+                                Toast.makeText(this, "Conectado ao IP $ipStr!", Toast.LENGTH_SHORT).show()
+                            }
+                        } catch (e: Exception) {
+                            runOnUiThread {
+                                Toast.makeText(this, "IP inválido!", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }
+            }
+            .setNegativeButton("Cancelar", null)
             .show()
     }
 
