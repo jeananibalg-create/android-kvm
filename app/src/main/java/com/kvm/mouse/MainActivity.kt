@@ -34,7 +34,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Android KVM v2.0 (Zero-Latency)"
+            text = "Android KVM v2.1 (Zero-Latency)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }

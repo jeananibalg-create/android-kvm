@@ -1,6 +1,8 @@
 package com.kvm.mouse
 
 import android.hardware.input.InputManager
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.KeyCharacterMap
@@ -20,38 +22,89 @@ class InputInjectorService : IInputInjector.Stub() {
         )
     }
 
+    private val handler = Handler(Looper.getMainLooper())
     private var downTime = 0L
-    private var isPressed = false
+    private var isLeftPressed = false
+    private var isRightPressed = false
+    private var rightLongPressTriggered = false
+    private var lastX = 0f
+    private var lastY = 0f
+
+    private val rightLongPressRunnable = Runnable {
+        if (isRightPressed) {
+            rightLongPressTriggered = true
+            val now = SystemClock.uptimeMillis()
+            downTime = now
+            // Injeta toque longo nativo na coordenada exata para abrir menu/opções do atalho na One UI
+            dispatchTouch(downTime, now, MotionEvent.ACTION_DOWN, lastX, lastY, 1.0f)
+        }
+    }
 
     override fun injectMove(x: Float, y: Float) {
+        lastX = x
+        lastY = y
         val now = SystemClock.uptimeMillis()
-        if (isPressed) {
-            dispatchMotion(downTime, now, MotionEvent.ACTION_MOVE, x, y, MotionEvent.BUTTON_PRIMARY, 0f, 0f)
-        } else {
-            dispatchMotion(now, now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0, 0f, 0f)
+        when {
+            isLeftPressed -> {
+                dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
+            }
+            rightLongPressTriggered -> {
+                dispatchTouch(downTime, now, MotionEvent.ACTION_MOVE, x, y, 1.0f)
+            }
+            else -> {
+                dispatchMouseHover(now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0f, 0f)
+            }
         }
     }
 
     override fun injectButton(action: Int, x: Float, y: Float, buttonState: Int) {
+        lastX = x
+        lastY = y
         val now = SystemClock.uptimeMillis()
+
+        if (buttonState == MotionEvent.BUTTON_SECONDARY) {
+            if (action == MotionEvent.ACTION_DOWN) {
+                isRightPressed = true
+                rightLongPressTriggered = false
+                handler.removeCallbacks(rightLongPressRunnable)
+                // Se segurar o botão direito por 320ms, abre o menu do atalho/ícone
+                handler.postDelayed(rightLongPressRunnable, 320)
+            } else if (action == MotionEvent.ACTION_UP) {
+                handler.removeCallbacks(rightLongPressRunnable)
+                if (rightLongPressTriggered) {
+                    // Solta o toque longo do menu de contexto
+                    val dTime = if (downTime > 0L) downTime else now
+                    dispatchTouch(dTime, now, MotionEvent.ACTION_UP, x, y, 0.0f)
+                    downTime = 0L
+                } else if (isRightPressed) {
+                    // Clique rápido com o botão direito = Voltar
+                    injectKey(KeyEvent.KEYCODE_BACK)
+                }
+                isRightPressed = false
+                rightLongPressTriggered = false
+            }
+            return
+        }
+
+        // Botão Esquerdo: emula toque capacitivo direto para abrir apps, links e gestos sem falhar na One UI
         if (action == MotionEvent.ACTION_DOWN) {
             downTime = now
-            isPressed = true
-            dispatchMotion(downTime, now, MotionEvent.ACTION_DOWN, x, y, MotionEvent.BUTTON_PRIMARY, 0f, 0f)
-            dispatchMotion(downTime, now, MotionEvent.ACTION_BUTTON_PRESS, x, y, MotionEvent.BUTTON_PRIMARY, 0f, 0f)
+            isLeftPressed = true
+            dispatchTouch(downTime, now, MotionEvent.ACTION_DOWN, x, y, 1.0f)
         } else if (action == MotionEvent.ACTION_UP) {
             val dTime = if (downTime > 0L) downTime else now
-            dispatchMotion(dTime, now, MotionEvent.ACTION_BUTTON_RELEASE, x, y, 0, 0f, 0f)
-            dispatchMotion(dTime, now, MotionEvent.ACTION_UP, x, y, 0, 0f, 0f)
-            isPressed = false
+            dispatchTouch(dTime, now, MotionEvent.ACTION_UP, x, y, 0.0f)
+            isLeftPressed = false
             downTime = 0L
         }
     }
 
     override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float) {
+        lastX = x
+        lastY = y
         val now = SystemClock.uptimeMillis()
-        dispatchMotion(now, now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0, 0f, 0f)
-        dispatchMotion(now, now, MotionEvent.ACTION_SCROLL, x, y, 0, vScroll * 2.2f, hScroll * 2.2f)
+        dispatchMouseHover(now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0f, 0f)
+        dispatchMouseHover(now, MotionEvent.ACTION_SCROLL, x, y, vScroll * 2.5f, hScroll * 2.5f)
     }
 
     override fun injectKey(keyCode: Int) {
@@ -65,13 +118,40 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
-    private fun dispatchMotion(
+    private fun dispatchTouch(
         dTime: Long,
         eTime: Long,
         action: Int,
         x: Float,
         y: Float,
-        btnState: Int,
+        pressureVal: Float
+    ) {
+        try {
+            val props = arrayOf(MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = MotionEvent.TOOL_TYPE_FINGER
+            })
+            val coords = arrayOf(MotionEvent.PointerCoords().apply {
+                this.x = x
+                this.y = y
+                pressure = pressureVal
+                size = 0.5f
+            })
+            val event = MotionEvent.obtain(
+                dTime, eTime, action, 1, props, coords,
+                0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+            )
+            injectMethod.invoke(inputManager, event, 0)
+            event.recycle()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun dispatchMouseHover(
+        eTime: Long,
+        action: Int,
+        x: Float,
+        y: Float,
         vScroll: Float,
         hScroll: Float
     ) {
@@ -83,14 +163,14 @@ class InputInjectorService : IInputInjector.Stub() {
             val coords = arrayOf(MotionEvent.PointerCoords().apply {
                 this.x = x
                 this.y = y
-                pressure = if (isPressed) 1.0f else 0.0f
+                pressure = 0.0f
                 size = 1.0f
                 setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
                 setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
             })
             val event = MotionEvent.obtain(
-                dTime, eTime, action, 1, props, coords,
-                0, btnState, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0
+                eTime, eTime, action, 1, props, coords,
+                0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0
             )
             injectMethod.invoke(inputManager, event, 0)
             event.recycle()
@@ -99,6 +179,7 @@ class InputInjectorService : IInputInjector.Stub() {
     }
 
     override fun destroy() {
+        handler.removeCallbacksAndMessages(null)
         exitProcess(0)
     }
 }

@@ -38,7 +38,7 @@ class PointerCaptureActivity : Activity() {
         }
 
         val hint = TextView(this).apply {
-            text = "Cursor no Fold 4  |  Botão Direito = Voltar  |  Botão Meio = Início"
+            text = "Cursor no Escravo  |  Dir. Rápido = Voltar  |  Segurar Dir. = Opções"
             textSize = 11f
             setTextColor(Color.argb(160, 255, 255, 255))
             setPadding(24, 64, 24, 16)
@@ -111,12 +111,12 @@ class PointerCaptureActivity : Activity() {
                 lastButtonState = event.buttonState
                 when {
                     (pressed and MotionEvent.BUTTON_SECONDARY) != 0 -> {
-                        UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_BACK)
+                        UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_SECONDARY)
                     }
                     (pressed and MotionEvent.BUTTON_TERTIARY) != 0 -> {
                         UdpFastSender.sendKey(peer, KeyEvent.KEYCODE_HOME)
                     }
-                    else -> {
+                    (pressed and MotionEvent.BUTTON_PRIMARY) != 0 || event.buttonState == 0 -> {
                         UdpFastSender.sendButton(peer, MotionEvent.ACTION_DOWN, MotionEvent.BUTTON_PRIMARY)
                     }
                 }
@@ -124,8 +124,10 @@ class PointerCaptureActivity : Activity() {
             MotionEvent.ACTION_UP, MotionEvent.ACTION_BUTTON_RELEASE -> {
                 val released = lastButtonState and event.buttonState.inv()
                 lastButtonState = event.buttonState
-                if ((released and MotionEvent.BUTTON_PRIMARY) != 0 || event.buttonState == 0) {
-                    UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, 0)
+                if ((released and MotionEvent.BUTTON_SECONDARY) != 0) {
+                    UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_SECONDARY)
+                } else {
+                    UdpFastSender.sendButton(peer, MotionEvent.ACTION_UP, MotionEvent.BUTTON_PRIMARY)
                 }
             }
             MotionEvent.ACTION_SCROLL -> {
