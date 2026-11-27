@@ -1,11 +1,11 @@
 package com.kvm.mouse
 
-import android.content.Context
 import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.system.Int32Ref
 import android.system.Os
 import android.system.OsConstants
 import android.view.InputDevice
@@ -23,49 +23,69 @@ import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
 class InputInjectorService : IInputInjector.Stub() {
-    private val context by lazy { createPackageContext("com.kvm.mouse", Context.CONTEXT_IGNORE_SECURITY) }
+    companion object {
+        // ioctl EVIOCGRAB = _IOW('E', 0x90, int) = 0x40044590
+        private const val EVIOCGRAB = 0x40044590
+    }
+
     private val inputManager: InputManager by lazy {
         InputManager::class.java.getMethod("getInstance").invoke(null) as InputManager
     }
+
     private val injectMethod by lazy {
-        InputManager::class.java.getMethod("injectInputEvent", android.view.InputEvent::class.java, Int::class.javaPrimitiveType)
+        InputManager::class.java.getMethod(
+            "injectInputEvent",
+            android.view.InputEvent::class.java,
+            Int::class.javaPrimitiveType
+        )
     }
+
+    private val ioctlIntMethod by lazy {
+        Os::class.java.getMethod(
+            "ioctlInt",
+            FileDescriptor::class.java,
+            Int::class.javaPrimitiveType,
+            Int32Ref::class.java
+        )
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private var uhidOut: FileOutputStream? = null
     private var currentButtonsMask = 0
 
     @Volatile private var monitoringHardware = false
+    @Volatile private var exclusiveGrabActive = false
     private var hwCallback: IMouseEventCallback? = null
     private val openMouseFds = ConcurrentHashMap<String, FileDescriptor>()
 
     private val mouseHidDescriptor = byteArrayOf(
-        0x05, 0x01,        // Usage Page (Generic Desktop)
-        0x09, 0x02,        // Usage (Mouse)
-        0xA1.toByte(), 0x01, // Collection (Application)
-        0x09, 0x01,        //   Usage (Pointer)
-        0xA1.toByte(), 0x00, //   Collection (Physical)
-        0x05, 0x09,        //     Usage Page (Button)
-        0x19, 0x01,        //     Usage Minimum (Button 1)
-        0x29, 0x03,        //     Usage Maximum (Button 3)
-        0x15, 0x00,        //     Logical Minimum (0)
-        0x25, 0x01,        //     Logical Maximum (1)
-        0x95.toByte(), 0x03, //     Report Count (3)
-        0x75, 0x01,        //     Report Size (1)
-        0x81.toByte(), 0x02, //     Input (Data, Variable, Absolute)
-        0x95.toByte(), 0x01, //     Report Count (1)
-        0x75, 0x05,        //     Report Size (5)
-        0x81.toByte(), 0x03, //     Input (Constant)
-        0x05, 0x01,        //     Usage Page (Generic Desktop)
-        0x09, 0x30,        //     Usage (X)
-        0x09, 0x31,        //     Usage (Y)
-        0x09, 0x38,        //     Usage (Wheel)
-        0x15, 0x81.toByte(), //     Logical Minimum (-127)
-        0x25, 0x7F,        //     Logical Maximum (127)
-        0x75, 0x08,        //     Report Size (8)
-        0x95.toByte(), 0x03, //     Report Count (3)
-        0x81.toByte(), 0x06, //     Input (Data, Variable, Relative)
-        0xC0.toByte(),       //   End Collection
-        0xC0.toByte()        // End Collection
+        0x05, 0x01,
+        0x09, 0x02,
+        0xA1.toByte(), 0x01,
+        0x09, 0x01,
+        0xA1.toByte(), 0x00,
+        0x05, 0x09,
+        0x19, 0x01,
+        0x29, 0x03,
+        0x15, 0x00,
+        0x25, 0x01,
+        0x95.toByte(), 0x03,
+        0x75, 0x01,
+        0x81.toByte(), 0x02,
+        0x95.toByte(), 0x01,
+        0x75, 0x05,
+        0x81.toByte(), 0x03,
+        0x05, 0x01,
+        0x09, 0x30,
+        0x09, 0x31,
+        0x09, 0x38,
+        0x15, 0x81.toByte(),
+        0x25, 0x7F,
+        0x75, 0x08,
+        0x95.toByte(), 0x03,
+        0x81.toByte(), 0x06,
+        0xC0.toByte(),
+        0xC0.toByte()
     )
 
     private fun isPhysicalMouseDevice(eventName: String): Boolean {
@@ -73,9 +93,12 @@ class InputInjectorService : IInputInjector.Stub() {
             val sysBase = File("/sys/class/input/$eventName/device")
             val nameFile = File(sysBase, "name")
             val devName = if (nameFile.exists()) nameFile.readText().trim().lowercase() else ""
-            if (devName.contains("kvm") || devName.contains("touch") || devName.contains("sensor") || devName.contains("gpio")) return false
+            if (devName.contains("kvm") || devName.contains("touch") || devName.contains("sensor") || devName.contains("gpio")) {
+                return false
+            }
 
             val relFile = File(sysBase, "capabilities/rel")
+            val absFile = File(sysBase, "capabilities/abs")
             val keyFile = File(sysBase, "capabilities/key")
             if (!relFile.exists() || !keyFile.exists()) return false
 
@@ -83,9 +106,29 @@ class InputInjectorService : IInputInjector.Stub() {
             if (relHex.isEmpty() || relHex == "0") return false
 
             val lastRelWord = relHex.split(" ").last().toLongOrNull(16) ?: 0L
-            return (lastRelWord and 0x03L) == 0x03L
+            val hasRelXY = (lastRelWord and 0x03L) == 0x03L
+            if (!hasRelXY) return false
+
+            val absHex = if (absFile.exists()) absFile.readText().trim() else "0"
+            if (absHex != "0" && absHex.isNotEmpty()) return false
+
+            return true
         } catch (_: Exception) {
             return false
+        }
+    }
+
+    private fun applyGrabToFd(fd: FileDescriptor, grab: Boolean) {
+        try {
+            ioctlIntMethod.invoke(null, fd, EVIOCGRAB, Int32Ref(if (grab) 1 else 0))
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun setExclusiveMouseGrab(grab: Boolean) {
+        exclusiveGrabActive = grab
+        openMouseFds.values.forEach { fd ->
+            applyGrabToFd(fd, grab)
         }
     }
 
@@ -94,7 +137,12 @@ class InputInjectorService : IInputInjector.Stub() {
             Runtime.getRuntime().exec(arrayOf("dumpsys", "deviceidle", "whitelist", "+com.kvm.mouse"))
             Runtime.getRuntime().exec(arrayOf("cmd", "appops", "set", "com.kvm.mouse", "SYSTEM_ALERT_WINDOW", "allow"))
             Runtime.getRuntime().exec(arrayOf("cmd", "appops", "set", "com.kvm.mouse", "RUN_IN_BACKGROUND", "allow"))
-        } catch (_: Exception) {}
+            Runtime.getRuntime().exec(arrayOf("cmd", "appops", "set", "com.kvm.mouse", "RUN_ANY_IN_BACKGROUND", "allow"))
+            if (enableLockscreenMode) {
+                Runtime.getRuntime().exec(arrayOf("settings", "put", "secure", "wake_gesture_enabled", "0"))
+            }
+        } catch (_: Exception) {
+        }
     }
 
     @Synchronized
@@ -106,15 +154,15 @@ class InputInjectorService : IInputInjector.Stub() {
             val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
 
             buf.putInt(11) // UHID_CREATE2
-            val nameBytes = "Android KVM Mouse".toByteArray(Charsets.UTF_8)
+            val nameBytes = "Samsung Multi Control Mouse".toByteArray(Charsets.UTF_8)
             buf.put(nameBytes)
             buf.position(4 + 128 + 64 + 64)
 
             buf.putShort(mouseHidDescriptor.size.toShort())
             buf.putShort(0x05) // BUS_BLUETOOTH
-            buf.putInt(0x04E8) // Vendor ID (Samsung-like)
-            buf.putInt(0x7021) // Product ID
-            buf.putInt(0x0100) // Version
+            buf.putInt(0x04E8)
+            buf.putInt(0x7021)
+            buf.putInt(0x0100)
             buf.putInt(0)
             buf.put(mouseHidDescriptor)
 
@@ -131,11 +179,12 @@ class InputInjectorService : IInputInjector.Stub() {
     override fun destroyVirtualMouse() {
         val fos = uhidOut ?: return
         try {
-            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array() // UHID_DESTROY
+            val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(1).array()
             fos.write(buf)
             fos.flush()
             fos.close()
-        } catch (_: Exception) {} finally {
+        } catch (_: Exception) {
+        } finally {
             uhidOut = null
             currentButtonsMask = 0
         }
@@ -158,9 +207,9 @@ class InputInjectorService : IInputInjector.Stub() {
                 remX -= stepX
                 remY -= stepY
 
-                val buf = ByteBuffer.allocate(10).order(ByteOrder.LITTLE_ENDIAN)
+                val buf = ByteBuffer.allocate(4 + 2 + 4).order(ByteOrder.LITTLE_ENDIAN)
                 buf.putInt(12) // UHID_INPUT2
-                buf.putShort(4)  // Payload size
+                buf.putShort(4)
                 buf.put((buttons and 0x07).toByte())
                 buf.put(stepX.toByte())
                 buf.put(stepY.toByte())
@@ -199,6 +248,31 @@ class InputInjectorService : IInputInjector.Stub() {
         }
     }
 
+    override fun setScreenPower(on: Boolean) {
+        val now = SystemClock.uptimeMillis()
+        try {
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val currentApp = activityThreadClass.getMethod("currentApplication").invoke(null) as android.content.Context
+            val pm = currentApp.getSystemService(android.content.Context.POWER_SERVICE) as PowerManager
+            if (on) {
+                val wakeMethod = PowerManager::class.java.getMethod("wakeUp", Long::class.javaPrimitiveType)
+                wakeMethod.invoke(pm, now)
+            } else {
+                val sleepMethod = PowerManager::class.java.getMethod("goToSleep", Long::class.javaPrimitiveType)
+                sleepMethod.invoke(pm, now)
+            }
+        } catch (_: Exception) {
+            try {
+                if (!on) {
+                    Runtime.getRuntime().exec(arrayOf("input", "keyevent", "223")) // KEYCODE_SLEEP
+                } else {
+                    Runtime.getRuntime().exec(arrayOf("input", "keyevent", "224")) // KEYCODE_WAKEUP
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     override fun startHardwareMouseMonitor(callback: IMouseEventCallback?) {
         hwCallback = callback
         if (monitoringHardware) return
@@ -224,6 +298,9 @@ class InputInjectorService : IInputInjector.Stub() {
         try {
             fd = Os.open(file.absolutePath, OsConstants.O_RDONLY, 0)
             openMouseFds[file.name] = fd
+            if (exclusiveGrabActive) {
+                applyGrabToFd(fd, true)
+            }
 
             FileInputStream(fd).use { fis ->
                 val buf = ByteArray(24)
@@ -239,8 +316,8 @@ class InputInjectorService : IInputInjector.Stub() {
                         offset += r
                     }
                     bb.rewind()
-                    bb.long // sec
-                    bb.long // usec
+                    bb.long
+                    bb.long
                     val type = bb.short.toInt() and 0xFFFF
                     val code = bb.short.toInt() and 0xFFFF
                     val value = bb.int
@@ -250,7 +327,9 @@ class InputInjectorService : IInputInjector.Stub() {
                             when (code) {
                                 0x00 -> accX += value.toFloat()
                                 0x01 -> accY += value.toFloat()
-                                0x08 -> hwCallback?.onMouseScroll(value.toFloat())
+                                0x08 -> {
+                                    try { hwCallback?.onMouseScroll(value.toFloat()) } catch (_: Exception) {}
+                                }
                             }
                         }
                         0x01 -> { // EV_KEY
@@ -266,12 +345,14 @@ class InputInjectorService : IInputInjector.Stub() {
                                     0x112 -> MotionEvent.BUTTON_TERTIARY
                                     else -> 0
                                 }
-                                if (btn != 0) hwCallback?.onMouseButton(action, btn)
+                                if (btn != 0) {
+                                    try { hwCallback?.onMouseButton(action, btn) } catch (_: Exception) {}
+                                }
                             }
                         }
                         0x00 -> { // EV_SYN
                             if (accX != 0f || accY != 0f) {
-                                hwCallback?.onMouseDelta(accX, accY)
+                                try { hwCallback?.onMouseDelta(accX, accY) } catch (_: Exception) {}
                                 accX = 0f
                                 accY = 0f
                             }
@@ -279,16 +360,24 @@ class InputInjectorService : IInputInjector.Stub() {
                     }
                 }
             }
-        } catch (_: Exception) {} finally {
+        } catch (_: Exception) {
+        } finally {
             openMouseFds.remove(file.name)
-            if (fd != null) try { Os.close(fd) } catch (_: Exception) {}
+            if (fd != null) {
+                applyGrabToFd(fd, false)
+                try { Os.close(fd) } catch (_: Exception) {}
+            }
         }
     }
 
     override fun stopHardwareMouseMonitor() {
         monitoringHardware = false
+        exclusiveGrabActive = false
         handler.removeCallbacks(rescanRunnable)
-        openMouseFds.values.forEach { fd -> try { Os.close(fd) } catch (_: Exception) {} }
+        openMouseFds.values.forEach { fd ->
+            applyGrabToFd(fd, false)
+            try { Os.close(fd) } catch (_: Exception) {}
+        }
         openMouseFds.clear()
         hwCallback = null
     }
@@ -300,26 +389,8 @@ class InputInjectorService : IInputInjector.Stub() {
             val up = KeyEvent(now, now + 15, KeyEvent.ACTION_UP, keyCode, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD)
             injectMethod.invoke(inputManager, down, 0)
             injectMethod.invoke(inputManager, up, 0)
-        } catch (_: Exception) {}
-    }
-
-    override fun turnOffScreen() {
-        try {
-            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (pm.isInteractive) {
-                // O comando 'input' funciona perfeitamente via shell do Shizuku
-                Runtime.getRuntime().exec("input keyevent 26")
-            }
-        } catch (_: Exception) {}
-    }
-
-    override fun wakeUpScreen() {
-        try {
-            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isInteractive) {
-                Runtime.getRuntime().exec("input keyevent 26")
-            }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
     }
 
     override fun destroy() {
