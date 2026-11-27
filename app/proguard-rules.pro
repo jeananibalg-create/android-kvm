@@ -1,0 +1,4 @@
+-keep class com.kvm.mouse.IInputInjector { *; }
+-keep class com.kvm.mouse.IInputInjector$Stub { *; }
+-keep class com.kvm.mouse.IMouseEventCallback { *; }
+-keep class com.kvm.mouse.IMouseEventCallback$Stub { *; }

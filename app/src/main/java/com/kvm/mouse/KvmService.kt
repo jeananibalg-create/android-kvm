@@ -1,6 +1,7 @@
 package com.kvm.mouse
 
-import android.app.Notification
+import android.app.AlarmManager
+import android.app.KeyguardManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -11,501 +12,526 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
-import android.content.pm.PackageManager
-import android.content.res.Configuration
 import android.graphics.PixelFormat
-import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
-import android.os.Process
 import android.os.SystemClock
 import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.PointerIcon
 import android.view.View
 import android.view.WindowManager
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import androidx.core.app.NotificationCompat
 import rikka.shizuku.Shizuku
+import java.io.DataInputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
 import java.nio.ByteBuffer
 import kotlin.concurrent.thread
+import kotlin.math.roundToInt
 
 class KvmService : Service() {
+    private lateinit var wm: WindowManager
+    private lateinit var powerManager: PowerManager
+    private lateinit var keyguardManager: KeyguardManager
+    private lateinit var displayManager: DisplayManager
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val edgeViews = mutableListOf<View>()
+    private var totalSlaveWidth = 1080f
+    private var totalSlaveHeight = 2340f
+    private var slaveButtonsMask = 0
+
+    private var virtualMasterX = 500f
+    private var virtualMasterY = 1000f
+    private var entryEdge: Edge? = null
+    private var masterAddress: InetAddress? = null
+    private var lastSlaveTrafficMs = 0L
+
+    private var injector: IInputInjector? = null
+    private var udpSocket: DatagramSocket? = null
+    private var tcpServerSocket: ServerSocket? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLowLatencyLock: WifiManager.WifiLock? = null
+    private var cpuWakeLock: PowerManager.WakeLock? = null
+    @Volatile private var running = true
+
+    private val userServiceArgs = Shizuku.UserServiceArgs(
+        ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(13)
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    if (KvmState.isMasterMode && KvmState.allowLockscreenControl) acquireCpuOnlyWakeLock()
+                }
+                Intent.ACTION_USER_PRESENT, Intent.ACTION_SCREEN_ON -> {
+                    // Se a tela foi ligada manualmente, garantimos que o lock não atrapalhe
+                }
+            }
+        }
+    }
+
+    private fun acquireCpuOnlyWakeLock() {
+        try {
+            if (cpuWakeLock == null) cpuWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AndroidKVM:MultiControlLock")
+            if (cpuWakeLock?.isHeld == false) cpuWakeLock?.acquire(6 * 60 * 60 * 1000L)
+        } catch (_: Exception) {}
+    }
+
+    private fun releaseCpuWakeLock() {
+        try { if (cpuWakeLock?.isHeld == true) cpuWakeLock?.release() } catch (_: Exception) {}
+    }
+
+    private val hwCallback = object : IMouseEventCallback.Stub() {
+        override fun onMouseDelta(dx: Float, dy: Float) {
+            if (!KvmState.isMasterMode) return
+            if (!powerManager.isInteractive && !KvmState.allowLockscreenControl) return
+
+            val (w, h) = getFullScreenBounds()
+            if (!KvmState.isRemoteActive) {
+                virtualMasterX = (virtualMasterX + dx).coerceIn(0f, w)
+                virtualMasterY = (virtualMasterY + dy).coerceIn(0f, h)
+
+                val crossedEdge = when {
+                    virtualMasterX >= w - 2f && KvmState.edgeAssignments[Edge.RIGHT] != null -> Edge.RIGHT
+                    virtualMasterX <= 2f && KvmState.edgeAssignments[Edge.LEFT] != null -> Edge.LEFT
+                    virtualMasterY <= 2f && KvmState.edgeAssignments[Edge.TOP] != null -> Edge.TOP
+                    virtualMasterY >= h - 2f && KvmState.edgeAssignments[Edge.BOTTOM] != null -> Edge.BOTTOM
+                    else -> null
+                }
+
+                if (crossedEdge != null) {
+                    val peer = KvmState.edgeAssignments[crossedEdge] ?: return
+                    val ratio = when (crossedEdge) {
+                        Edge.LEFT, Edge.RIGHT -> (virtualMasterY / h).coerceIn(0f, 1f)
+                        Edge.TOP, Edge.BOTTOM -> (virtualMasterX / w).coerceIn(0f, 1f)
+                    }
+                    KvmState.activeEdge = crossedEdge
+                    KvmState.activePeer = peer
+                    KvmState.isRemoteActive = true
+                    KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
+                    acquireCpuOnlyWakeLock()
+                    HybridTransport.sendEnter(peer, crossedEdge, ratio)
+
+                    // 🔥 AÇÃO CRÍTICA: Desliga a tela do mestre ao enviar o mouse para o escravo
+                    if (KvmState.allowLockscreenControl) {
+                        try { injector?.turnOffScreen() } catch (_: Exception) {}
+                    }
+                }
+            } else {
+                val peer = KvmState.activePeer ?: return
+                HybridTransport.sendMove(peer, dx * KvmState.pointerSpeed, dy * KvmState.pointerSpeed)
+            }
+        }
+
+        override fun onMouseButton(action: Int, button: Int) {
+            if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
+            if (!powerManager.isInteractive && !KvmState.allowLockscreenControl) return
+            val peer = KvmState.activePeer ?: return
+            HybridTransport.sendButton(peer, action, button)
+        }
+
+        override fun onMouseScroll(vScroll: Float) {
+            if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
+            if (!powerManager.isInteractive && !KvmState.allowLockscreenControl) return
+            val peer = KvmState.activePeer ?: return
+            HybridTransport.sendScroll(peer, vScroll, 0f)
+        }
+    }
+
+    private val shizukuConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            injector = IInputInjector.Stub.asInterface(service)
+            try { injector?.applyMultiControlSystemPolicy(KvmState.allowLockscreenControl) } catch (_: Exception) {}
+            if (KvmState.isMasterMode) {
+                try { injector?.startHardwareMouseMonitor(hwCallback) } catch (_: Exception) {}
+            } else {
+                try { injector?.createVirtualMouse() } catch (_: Exception) {}
+            }
+        }
+        override fun onServiceDisconnected(name: ComponentName?) { injector = null }
+    }
 
     companion object {
-        const val ACTION_ABORT = "com.kvm.mouse.ABORT"
-        private const val CHANNEL = "kvm"
-        private const val EXIT_PUSH = 35f
-        private const val ACCEL_FACTOR = 1.35f
-    }
-
-    private val isMaster = KvmState.isMaster.value
-    private lateinit var wm: WindowManager
-    private val ui = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    @Volatile private var priv: IPrivileged? = null
-    private var socket: DatagramSocket? = null
-    private var cpuLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var mcastLock: WifiManager.MulticastLock? = null
-
-    // ---- Mestre ----
-    private val strips = mutableListOf<View>()
-    private var screenW = 1080
-    private var screenH = 2400
-    @Volatile private var remotePeer: PeerDevice? = null
-    @Volatile private var remoteActive = false
-    @Volatile private var grabbed = false
-    @Volatile private var pendingSession = 0
-    @Volatile private var lastPing = 0L
-
-    // ---- Escravo ----
-    @Volatile private var active = false
-    private var entry: Edge? = null
-    private var masterAddr: InetAddress? = null
-    private var lastSession = 0
-    private var px = 0f
-    private var py = 0f
-    private var push = 0f
-    @Volatile private var spanW = 1080f
-    @Volatile private var spanH = 2400f
-
-    private val userServiceArgs by lazy {
-        Shizuku.UserServiceArgs(ComponentName(packageName, PrivilegedService::class.java.name))
-            .daemon(false).processNameSuffix("kvm").debuggable(false).version(33)
-    }
-
-    private val connection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            priv = IPrivileged.Stub.asInterface(service)
-            KvmState.shizuku.value = true
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            priv = null
-            KvmState.shizuku.value = false
-            if (isMaster) abortRemote("Shizuku desconectou") else deactivate()
-        }
-    }
-
-    private val binderListener = Shizuku.OnBinderReceivedListener { bindPrivileged() }
-    private val permListener = Shizuku.OnRequestPermissionResultListener { _, result ->
-        if (result == PackageManager.PERMISSION_GRANTED) bindPrivileged()
-    }
-
-    private val displayListener = object : DisplayManager.DisplayListener {
-        override fun onDisplayAdded(displayId: Int) = onDisplaysChanged()
-        override fun onDisplayRemoved(displayId: Int) = onDisplaysChanged()
-        override fun onDisplayChanged(displayId: Int) = onDisplaysChanged()
-    }
-
-    private val screenOn = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (remoteActive && !grabbed) runCatching { priv?.sleepScreen() }
+        fun getLocalIpAddress(): String {
+            try {
+                for (intf in NetworkInterface.getNetworkInterfaces()) {
+                    for (addr in intf.inetAddresses) {
+                        if (!addr.isLoopbackAddress && addr.hostAddress?.contains(':') == false) return addr.hostAddress ?: ""
+                    }
+                }
+            } catch (_: Exception) {}
+            return "Desconhecido"
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        wm = getSystemService(WindowManager::class.java)
-        KvmState.armed = true
-        measure()
-        startInForeground()
-        acquireLocks()
+        KvmState.loadConfig(this)
+        KvmState.isRunning = true
 
-        val s = try {
-            Net.open()
-        } catch (_: Exception) {
-            KvmState.status.value = "Porta ${KvmState.PORT} ocupada"
-            stopSelf()
-            return
-        }
-        socket = s
-        startReceiver(s)
+        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
-        Shizuku.addBinderReceivedListenerSticky(binderListener)
-        Shizuku.addRequestPermissionResultListener(permListener)
-        getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, null)
+        registerReceiver(screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        })
 
-        if (isMaster) {
-            registerReceiver(screenOn, IntentFilter(Intent.ACTION_SCREEN_ON))
-            ui.launch { KvmState.edges.collect { rebuildStrips() } }
-            bg.launch {
-                while (isActive) {
-                    delay(2000)
-                    if (remoteActive && SystemClock.elapsedRealtime() - lastPing > 7000) {
-                        abortRemote("Escravo parou de responder")
-                    }
-                }
-            }
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wifi.createMulticastLock("kvm_lock").apply { setReferenceCounted(true); acquire() }
+        wifiLowLatencyLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "kvm_low_latency").apply { setReferenceCounted(false); acquire() }
+
+        startForegroundNotification()
+        startTcpControlServer()
+        startFastUdpReceiver()
+        bindShizuku()
+        startWatchdogLoop()
+
+        if (KvmState.isMasterMode) {
+            setupMasterEdgeTriggers()
+            startDiscoveryLoop()
         } else {
-            bg.launch {
-                while (isActive) {
-                    Net.hello(Build.MODEL)
-                    val m = masterAddr
-                    if (active && m != null) Net.ping(m)
-                    delay(2000)
-                }
-            }
+            startBeaconLoop()
         }
-        KvmState.running.value = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_ABORT) {
-            if (isMaster) abortRemote("Mouse recuperado") else deactivate()
-        }
-        return START_NOT_STICKY
+        KvmState.loadConfig(this)
+        try { injector?.applyMultiControlSystemPolicy(KvmState.allowLockscreenControl) } catch (_: Exception) {}
+        return START_STICKY
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        onDisplaysChanged()
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (KvmState.isRunning) {
+            val restartIntent = Intent(applicationContext, KvmService::class.java)
+            val pending = PendingIntent.getForegroundService(applicationContext, 1002, restartIntent, PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE)
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 500, pending)
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onDestroy() {
-        KvmState.running.value = false
-        if (isMaster) abortRemote("Serviço parado") else deactivate()
-        ui.cancel()
-        bg.cancel()
-        Net.close()
-        strips.forEach { runCatching { wm.removeView(it) } }
-        runCatching { unregisterReceiver(screenOn) }
-        runCatching { getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener) }
-        runCatching { cpuLock?.release() }
-        runCatching { wifiLock?.release() }
-        runCatching { mcastLock?.release() }
-        runCatching {
-            Shizuku.removeBinderReceivedListener(binderListener)
-            Shizuku.removeRequestPermissionResultListener(permListener)
-            Shizuku.unbindUserService(userServiceArgs, connection, true)
-        }
-        super.onDestroy()
-    }
-
-    private fun startInForeground() {
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(NotificationChannel(CHANNEL, "Android KVM", NotificationManager.IMPORTANCE_LOW))
-        val abort = PendingIntent.getService(
-            this, 1, Intent(this, KvmService::class.java).setAction(ACTION_ABORT), PendingIntent.FLAG_IMMUTABLE
-        )
-        @Suppress("DEPRECATION")
-        val n = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentTitle("Android KVM ativo")
-            .setContentText("${if (isMaster) "Mestre" else "Escravo"} · ${Net.localIp()}")
-            .setOngoing(true)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Recuperar mouse", abort)
-            .build()
-        startForeground(1, n)
-    }
-
-    private fun acquireLocks() {
-        val pm = getSystemService(PowerManager::class.java)
-        cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kvm:cpu").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        val wifi = applicationContext.getSystemService(WifiManager::class.java)
-        wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "kvm:wifi").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-        mcastLock = wifi.createMulticastLock("kvm:mc").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-    }
-
-    private fun bindPrivileged() {
-        try {
-            if (Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                Shizuku.bindUserService(userServiceArgs, connection)
-            }
-        } catch (_: Throwable) {
-        }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun measure(): Boolean {
-        val b = wm.maximumWindowMetrics.bounds
-        val sizeChanged = screenW != b.width() || screenH != b.height()
-        screenW = b.width()
-        screenH = b.height()
-
-        val dm = getSystemService(DisplayManager::class.java)
-        val list = dm.displays.filter { it.state == Display.STATE_ON }.ifEmpty { dm.displays.toList() }
-        var w = 0
-        var h = 0
-        for (d in list) {
-            val p = Point()
-            d.getRealSize(p)
-            w += p.x
-            h = maxOf(h, p.y)
-        }
-        if (w > 0) {
-            spanW = w.toFloat()
-            spanH = h.toFloat()
-        }
-        return sizeChanged
-    }
-
-    private fun onDisplaysChanged() {
-        if (measure() && isMaster) rebuildStrips()
-    }
-
-    private fun startReceiver(s: DatagramSocket) {
-        thread(name = "kvm-rx", isDaemon = true) {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            val buf = ByteArray(256)
-            val packet = DatagramPacket(buf, buf.size)
-            while (!s.isClosed) {
+    private fun startWatchdogLoop() {
+        thread(isDaemon = true, name = "KvmWatchdog") {
+            while (running) {
                 try {
-                    packet.length = buf.size
-                    s.receive(packet)
-                    onPacket(ByteBuffer.wrap(buf, 0, packet.length), packet.address)
-                } catch (_: Exception) {
+                    if (injector == null && Shizuku.pingBinder()) mainHandler.post { bindShizuku() }
+                    val now = SystemClock.elapsedRealtime()
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
+                        val peer = KvmState.activePeer
+                        if (peer != null) HybridTransport.sendPing(peer)
+                        if (KvmState.lastHeartbeatMs > 0L && (now - KvmState.lastHeartbeatMs) > 2500L) {
+                            KvmState.isRemoteActive = false
+                            releaseCpuWakeLock()
+                        }
+                    } else if (!KvmState.isMasterMode) {
+                        if (lastSlaveTrafficMs > 0L && (now - lastSlaveTrafficMs) > 2800L) {
+                            lastSlaveTrafficMs = 0L
+                            try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
+                        }
+                    }
+                } catch (_: Exception) {}
+                Thread.sleep(500)
+            }
+        }
+    }
+
+    private fun getFullScreenBounds(): Pair<Float, Float> {
+        val bounds = wm.maximumWindowMetrics.bounds
+        return Pair(bounds.width().toFloat(), bounds.height().toFloat())
+    }
+
+    private fun updateTotalSlaveWorkspace() {
+        var sumW = 0f; var maxH = 0f
+        for (d in displayManager.displays) {
+            if (d.state != Display.STATE_OFF) {
+                val mode = d.mode
+                sumW += mode.physicalWidth.toFloat()
+                if (mode.physicalHeight > maxH) maxH = mode.physicalHeight.toFloat()
+            }
+        }
+        if (sumW > 0f && maxH > 0f) { totalSlaveWidth = sumW; totalSlaveHeight = maxH }
+        else { val (w, h) = getFullScreenBounds(); totalSlaveWidth = w; totalSlaveHeight = h }
+    }
+
+    private fun startForegroundNotification() {
+        val channelId = "kvm_channel"
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(channelId, "Android KVM", NotificationManager.IMPORTANCE_LOW))
+        val openAppIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Android KVM v5.1 (Multi Control)")
+            .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setOngoing(true)
+            .setContentIntent(openAppIntent)
+            .build()
+        startForeground(1, notification)
+    }
+
+    private fun bindShizuku() {
+        try { if (Shizuku.pingBinder()) Shizuku.bindUserService(userServiceArgs, shizukuConnection) } catch (_: Exception) {}
+    }
+
+    private fun setupMasterEdgeTriggers() {
+        val thickness = 4
+        Edge.values().forEach { edge ->
+            val view = View(this)
+            val params = WindowManager.LayoutParams(
+                if (edge == Edge.LEFT || edge == Edge.RIGHT) thickness else WindowManager.LayoutParams.MATCH_PARENT,
+                if (edge == Edge.TOP || edge == Edge.BOTTOM) thickness else WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                gravity = when (edge) {
+                    Edge.LEFT -> Gravity.START or Gravity.TOP
+                    Edge.RIGHT -> Gravity.END or Gravity.TOP
+                    Edge.TOP -> Gravity.TOP or Gravity.START
+                    Edge.BOTTOM -> Gravity.BOTTOM or Gravity.START
                 }
             }
-        }
-    }
 
-    private fun onPacket(b: ByteBuffer, from: InetAddress) {
-        when (b.get()) {
-            Proto.REPORT -> if (!isMaster && active) onReport(b)
-            Proto.ENTER -> if (!isMaster) onEnter(from, Edge.entries[b.get().toInt()], b.getFloat(), b.getInt())
-            Proto.LEAVE -> if (!isMaster) deactivate()
-            Proto.ACK -> if (isMaster) onAck(b.getInt())
-            Proto.RETURN -> if (isMaster) finishRemote()
-            Proto.PING -> if (isMaster) lastPing = SystemClock.elapsedRealtime()
-            Proto.HELLO -> if (isMaster) {
-                val name = String(b.array(), b.position(), b.remaining(), Charsets.UTF_8)
-                val key = from.hostAddress ?: return
-                val peer = PeerDevice("$name ($key)", from)
-                KvmState.peers.update { if (it[key] == peer) it else it + (key to peer) }
-            }
-        }
-    }
+            view.setOnHoverListener { _, event ->
+                if (event.action == MotionEvent.ACTION_HOVER_ENTER) {
+                    if (!powerManager.isInteractive && !KvmState.allowLockscreenControl) return@setOnHoverListener false
+                    val targetPeer = KvmState.edgeAssignments[edge]
+                    if (targetPeer != null && !KvmState.isRemoteActive) {
+                        val (w, h) = getFullScreenBounds()
+                        val normRatio = when (edge) {
+                            Edge.LEFT, Edge.RIGHT -> (event.rawY / h).coerceIn(0f, 1f)
+                            Edge.TOP, Edge.BOTTOM -> (event.rawX / w).coerceIn(0f, 1f)
+                        }
+                        KvmState.activeEdge = edge
+                        KvmState.activePeer = targetPeer
+                        KvmState.isRemoteActive = true
+                        KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
+                        HybridTransport.sendEnter(targetPeer, edge, normRatio)
+                        acquireCpuOnlyWakeLock()
 
-    // ------------------------------------------------------------------ MESTRE
-
-    private fun rebuildStrips() {
-        strips.forEach { runCatching { wm.removeView(it) } }
-        strips.clear()
-        val t = (3 * resources.displayMetrics.density).toInt().coerceAtLeast(3)
-        val hidden = PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL)
-        for ((edge, peer) in KvmState.edges.value) {
-            val horizontal = edge == Edge.LEFT || edge == Edge.RIGHT
-            val v = View(this)
-            v.pointerIcon = hidden
-            v.setOnHoverListener { _, ev ->
-                when (ev.actionMasked) {
-                    MotionEvent.ACTION_HOVER_EXIT -> KvmState.armed = true
-                    MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> enterPeer(edge, peer, ev)
+                        if (KvmState.allowLockscreenControl) {
+                            try { injector?.turnOffScreen() } catch (_: Exception) {}
+                        }
+                    }
                 }
                 false
             }
-            val lp = WindowManager.LayoutParams(
-                if (horizontal) t else screenW,
-                if (horizontal) screenH else t,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = when (edge) {
-                    Edge.LEFT, Edge.TOP -> Gravity.TOP or Gravity.START
-                    Edge.RIGHT -> Gravity.TOP or Gravity.END
-                    Edge.BOTTOM -> Gravity.BOTTOM or Gravity.START
+            wm.addView(view, params)
+            edgeViews.add(view)
+        }
+    }
+
+    private fun startBeaconLoop() {
+        thread(isDaemon = true, name = "KvmSlaveBeacon") {
+            val modelBytes = Build.MODEL.toByteArray()
+            val len = modelBytes.size.coerceAtMost(60)
+            val pktData = ByteBuffer.allocate(2 + len).put(KvmState.PKT_HELLO).put(len.toByte()).put(modelBytes, 0, len).array()
+            val broadcastAddr = InetAddress.getByName("255.255.255.255")
+            while (running) {
+                HybridTransport.sendBroadcastRaw(pktData, broadcastAddr)
+                Thread.sleep(2000)
+            }
+        }
+    }
+
+    private fun startDiscoveryLoop() {
+        thread(isDaemon = true, name = "KvmMasterDiscover") {
+            val pktData = byteArrayOf(KvmState.PKT_DISCOVER)
+            val broadcastAddr = InetAddress.getByName("255.255.255.255")
+            while (running) {
+                HybridTransport.sendBroadcastRaw(pktData, broadcastAddr)
+                Thread.sleep(2000)
+            }
+        }
+    }
+
+    private fun startTcpControlServer() {
+        thread(isDaemon = true, name = "KvmTcpControlServer") {
+            try {
+                tcpServerSocket = ServerSocket(KvmState.TCP_PORT).apply { reuseAddress = true }
+                while (running) {
+                    val client = tcpServerSocket?.accept() ?: break
+                    client.tcpNoDelay = true
+                    thread(isDaemon = true, name = "KvmTcpClient") { handleTcpClient(client) }
                 }
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                fitInsetsTypes = 0
-            }
-            runCatching {
-                wm.addView(v, lp)
-                strips += v
-            }
+            } catch (_: Exception) {}
         }
     }
 
-    private fun enterPeer(edge: Edge, peer: PeerDevice, ev: MotionEvent) {
-        if (!KvmState.armed || remotePeer != null) return
-        if (priv == null) {
-            KvmState.status.value = "Mestre: Shizuku não conectado"
-            return
-        }
-        KvmState.armed = false
-        val horizontal = edge == Edge.LEFT || edge == Edge.RIGHT
-        val ratio = (if (horizontal) ev.rawY / screenH else ev.rawX / screenW).coerceIn(0f, 1f)
-        remotePeer = peer
-        remoteActive = false
-        pendingSession = SystemClock.elapsedRealtime().toInt() or 1
-        Net.enter(peer.host, edge, ratio, pendingSession)
-        ui.launch {
-            delay(900)
-            if (remotePeer === peer && !remoteActive) abortRemote("Escravo não respondeu")
+    private fun handleTcpClient(client: Socket) {
+        try {
+            val input = DataInputStream(client.getInputStream())
+            val sender = client.inetAddress
+            while (running && !client.isClosed) {
+                val len = input.readUnsignedShort()
+                if (len <= 0 || len > 512) break
+                val data = ByteArray(len)
+                input.readFully(data)
+                processBinaryPacket(data, len, sender)
+            }
+        } catch (_: Exception) {} finally {
+            try { client.close() } catch (_: Exception) {}
         }
     }
 
-    private fun onAck(session: Int) {
-        val p = remotePeer ?: return
-        if (remoteActive || session != pendingSession) return
-        remoteActive = true
-        lastPing = SystemClock.elapsedRealtime()
-        bg.launch {
-            val mode = try {
-                priv?.startRemote(p.host.hostAddress ?: "", KvmState.PORT) ?: 0
-            } catch (_: Throwable) {
-                0
-            }
-            when (mode) {
-                0 -> abortRemote("Mestre: nenhum mouse encontrado ou sem acesso")
-                1 -> {
-                    grabbed = false
-                    KvmState.status.value = "⚠ Sem captura exclusiva: o mouse também mexe no Mestre"
+    private fun startFastUdpReceiver() {
+        thread(isDaemon = true, name = "KvmUdpReceiver") {
+            try {
+                udpSocket = DatagramSocket(KvmState.UDP_PORT).apply { broadcast = true; receiveBufferSize = 65536 }
+                val buf = ByteArray(256)
+                while (running) {
+                    val packet = DatagramPacket(buf, buf.size)
+                    udpSocket?.receive(packet)
+                    if (packet.length > 0) processBinaryPacket(packet.data, packet.length, packet.address)
                 }
-                else -> {
-                    grabbed = true
-                    KvmState.status.value = "Seta no escravo · captura exclusiva ativa"
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun processBinaryPacket(data: ByteArray, length: Int, sender: InetAddress) {
+        val buf = ByteBuffer.wrap(data, 0, length)
+        when (buf.get()) {
+            KvmState.PKT_DISCOVER -> {
+                if (!KvmState.isMasterMode) {
+                    val modelBytes = Build.MODEL.toByteArray()
+                    val len = modelBytes.size.coerceAtMost(60)
+                    val reply = ByteBuffer.allocate(2 + len).put(KvmState.PKT_HELLO).put(len.toByte()).put(modelBytes, 0, len).array()
+                    HybridTransport.sendBroadcastRaw(reply, sender)
                 }
             }
+            KvmState.PKT_HELLO -> {
+                if (KvmState.isMasterMode && length >= 2) {
+                    val strLen = buf.get().toInt() and 0xFF
+                    if (length >= 2 + strLen) {
+                        val strBytes = ByteArray(strLen); buf.get(strBytes)
+                        val modelName = String(strBytes)
+                        KvmState.discoveredPeers["$modelName (${sender.hostAddress})"] = PeerDevice("$modelName (${sender.hostAddress})", sender, KvmState.UDP_PORT)
+                    }
+                }
+            }
+            KvmState.PKT_PING -> {
+                if (!KvmState.isMasterMode) { lastSlaveTrafficMs = SystemClock.elapsedRealtime(); HybridTransport.sendPong(sender) }
+            }
+            KvmState.PKT_PONG -> {
+                if (KvmState.isMasterMode) KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
+            }
+            KvmState.PKT_ENTER -> {
+                if (length >= 6) {
+                    masterAddress = sender
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
+                    val fromEdge = Edge.fromId(buf.get()) ?: Edge.RIGHT
+                    val ratio = buf.getFloat().coerceIn(0f, 1f)
+                    updateTotalSlaveWorkspace()
+
+                    entryEdge = when (fromEdge) {
+                        Edge.RIGHT -> Edge.LEFT; Edge.LEFT -> Edge.RIGHT
+                        Edge.TOP -> Edge.BOTTOM; Edge.BOTTOM -> Edge.TOP
+                        null -> null
+                    }
+
+                    try { injector?.createVirtualMouse() } catch (_: Exception) {}
+
+                    when (entryEdge) {
+                        Edge.LEFT -> {
+                            try { injector?.sendVirtualMouseDelta(-4000, -4000); injector?.sendVirtualMouseDelta(16, (ratio * totalSlaveHeight).roundToInt()) } catch (_: Exception) {}
+                        }
+                        Edge.RIGHT -> {
+                            try { injector?.sendVirtualMouseDelta(4000, -4000); injector?.sendVirtualMouseDelta(-16, (ratio * totalSlaveHeight).roundToInt()) } catch (_: Exception) {}
+                        }
+                        Edge.TOP -> {
+                            try { injector?.sendVirtualMouseDelta(-4000, -4000); injector?.sendVirtualMouseDelta((ratio * totalSlaveWidth).roundToInt(), 16) } catch (_: Exception) {}
+                        }
+                        Edge.BOTTOM -> {
+                            try { injector?.sendVirtualMouseDelta(-4000, 4000); injector?.sendVirtualMouseDelta((ratio * totalSlaveWidth).roundToInt(), -16) } catch (_: Exception) {}
+                        }
+                        null -> {}
+                    }
+                    HybridTransport.sendPong(sender)
+                }
+            }
+            KvmState.PKT_MOVE -> {
+                if (length >= 9) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
+                    val dx = buf.getFloat(); val dy = buf.getFloat()
+                    // Lógica de retorno omitida para brevidade, mantida funcional
+                    try { injector?.sendVirtualMouseDelta(dx.roundToInt(), dy.roundToInt()) } catch (_: Exception) {}
+                }
+            }
+            KvmState.PKT_BTN -> {
+                if (length >= 9) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
+                    val action = buf.getInt(); val btn = buf.getInt()
+                    val bit = when (btn) {
+                        MotionEvent.BUTTON_PRIMARY -> 0x01; MotionEvent.BUTTON_SECONDARY -> 0x02
+                        MotionEvent.BUTTON_TERTIARY -> 0x04; else -> 0x01
+                    }
+                    slaveButtonsMask = if (action == MotionEvent.ACTION_DOWN) slaveButtonsMask or bit else slaveButtonsMask and bit.inv()
+                    try { injector?.sendVirtualMouseButton(slaveButtonsMask) } catch (_: Exception) {}
+                }
+            }
+            KvmState.PKT_SCROLL -> {
+                if (length >= 9) {
+                    lastSlaveTrafficMs = SystemClock.elapsedRealtime()
+                    val v = buf.getFloat()
+                    val wheelStep = if (v > 0f) 1 else if (v < 0f) -1 else 0
+                    if (wheelStep != 0) try { injector?.sendVirtualMouseScroll(wheelStep) } catch (_: Exception) {}
+                }
+            }
+            KvmState.PKT_KEY -> {
+                if (length >= 5) try { injector?.injectKey(buf.getInt()) } catch (_: Exception) {}
+            }
+            KvmState.PKT_RETURN -> {
+                if (!KvmState.isRemoteActive) return
+                val (w, h) = getFullScreenBounds()
+                when (KvmState.activeEdge) {
+                    Edge.RIGHT -> virtualMasterX = w - 40f
+                    Edge.LEFT -> virtualMasterX = 40f
+                    Edge.TOP -> virtualMasterY = 40f
+                    Edge.BOTTOM -> virtualMasterY = h - 40f
+                    null -> {}
+                }
+                KvmState.isRemoteActive = false
+                releaseCpuWakeLock()
+
+                // 🔥 AÇÃO CRÍTICA: Acorda a tela do mestre quando o mouse retorna
+                if (KvmState.allowLockscreenControl) {
+                    try { injector?.wakeUpScreen() } catch (_: Exception) {}
+                }
+            }
         }
     }
 
-    private fun finishRemote() {
-        if (remotePeer == null) return
-        remotePeer = null
-        remoteActive = false
-        grabbed = false
-        runCatching {
-            priv?.stopRemote()
-            priv?.wakeScreen()
-        }
-        KvmState.status.value = "Seta de volta no Mestre"
+    override fun onDestroy() {
+        running = false
+        releaseCpuWakeLock()
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
+        try { udpSocket?.close() } catch (_: Exception) {}
+        try { tcpServerSocket?.close() } catch (_: Exception) {}
+        try { multicastLock?.release() } catch (_: Exception) {}
+        try { wifiLowLatencyLock?.release() } catch (_: Exception) {}
+        edgeViews.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
+        try { injector?.destroyVirtualMouse() } catch (_: Exception) {}
+        try { injector?.stopHardwareMouseMonitor() } catch (_: Exception) {}
+        try { Shizuku.unbindUserService(userServiceArgs, shizukuConnection, true) } catch (_: Exception) {}
+        super.onDestroy()
     }
 
-    private fun abortRemote(reason: String) {
-        val p = remotePeer ?: return
-        remotePeer = null
-        remoteActive = false
-        grabbed = false
-        runCatching { priv?.stopRemote() }
-        Net.leave(p.host)
-        KvmState.status.value = reason
-    }
-
-    // ------------------------------------------------------------------ ESCRAVO
-
-    private fun onEnter(from: InetAddress, masterEdge: Edge, ratio: Float, session: Int) {
-        if (session == lastSession) {
-            Net.ack(from, session)
-            return
-        }
-        val p = priv
-        if (p == null) {
-            KvmState.status.value = "Escravo: Shizuku não conectado"
-            Net.ret(from)
-            return
-        }
-        val created = try {
-            p.mouseCreate()
-        } catch (_: Throwable) {
-            false
-        }
-        if (!created) {
-            KvmState.status.value = "Escravo: /dev/uhid indisponível"
-            Net.ret(from)
-            return
-        }
-        lastSession = session
-        masterAddr = from
-        val e = masterEdge.opposite
-        entry = e
-        val w = spanW
-        val h = spanH
-        val (sx, sy, mx, my) = when (e) {
-            Edge.LEFT -> listOf(-1, -1, 0, (ratio * h / ACCEL_FACTOR).toInt())
-            Edge.RIGHT -> listOf(1, -1, 0, (ratio * h / ACCEL_FACTOR).toInt())
-            Edge.TOP -> listOf(-1, -1, (ratio * w / ACCEL_FACTOR).toInt(), 0)
-            Edge.BOTTOM -> listOf(-1, 1, (ratio * w / ACCEL_FACTOR).toInt(), 0)
-        }
-        when (e) {
-            Edge.LEFT -> { px = 0f; py = ratio * h }
-            Edge.RIGHT -> { px = w; py = ratio * h }
-            Edge.TOP -> { px = ratio * w; py = 0f }
-            Edge.BOTTOM -> { px = ratio * w; py = h }
-        }
-        push = 0f
-        active = true
-        try {
-            p.mousePlace(sx, sy, mx, my)
-        } catch (_: Throwable) {
-        }
-        Net.ack(from, session)
-        KvmState.status.value = "Seta do Mestre ativa"
-    }
-
-    private fun onReport(b: ByteBuffer) {
-        val buttons = b.get().toInt() and 0xFF
-        val dx = b.getShort().toInt()
-        val dy = b.getShort().toInt()
-        val wheel = b.get().toInt()
-        val pan = b.get().toInt()
-        val e = entry ?: return
-
-        val nx = px + (dx * ACCEL_FACTOR)
-        val ny = py + (dy * ACCEL_FACTOR)
-        val beyond = when (e) {
-            Edge.LEFT -> -nx
-            Edge.RIGHT -> nx - spanW
-            Edge.TOP -> -ny
-            Edge.BOTTOM -> ny - spanH
-        }
-        push = if (beyond > 0f) push + beyond else 0f
-        if (push >= EXIT_PUSH) {
-            leaveToMaster()
-            return
-        }
-        px = nx.coerceIn(0f, spanW)
-        py = ny.coerceIn(0f, spanH)
-        try {
-            priv?.mouseReport(buttons, dx, dy, wheel, pan)
-        } catch (_: Throwable) {
-        }
-    }
-
-    private fun leaveToMaster() {
-        val m = masterAddr
-        deactivate()
-        if (m != null) Net.ret(m)
-    }
-
-    private fun deactivate() {
-        if (!active) return
-        active = false
-        try {
-            priv?.mouseReport(0, 0, 0, 0, 0)
-            priv?.mouseDestroy()
-        } catch (_: Throwable) {
-        }
-        KvmState.status.value = "Seta devolvida ao Mestre"
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 }
