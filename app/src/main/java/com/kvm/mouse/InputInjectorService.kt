@@ -5,7 +5,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
-import android.system.Int32Ref
 import android.system.Os
 import android.system.OsConstants
 import android.view.InputDevice
@@ -37,15 +36,6 @@ class InputInjectorService : IInputInjector.Stub() {
             "injectInputEvent",
             android.view.InputEvent::class.java,
             Int::class.javaPrimitiveType
-        )
-    }
-
-    private val ioctlIntMethod by lazy {
-        Os::class.java.getMethod(
-            "ioctlInt",
-            FileDescriptor::class.java,
-            Int::class.javaPrimitiveType,
-            Int32Ref::class.java
         )
     }
 
@@ -120,7 +110,16 @@ class InputInjectorService : IInputInjector.Stub() {
 
     private fun applyGrabToFd(fd: FileDescriptor, grab: Boolean) {
         try {
-            ioctlIntMethod.invoke(null, fd, EVIOCGRAB, Int32Ref(if (grab) 1 else 0))
+            val int32RefClass = Class.forName("android.system.Int32Ref")
+            val int32RefInstance = int32RefClass.getConstructor(Int::class.javaPrimitiveType)
+                .newInstance(if (grab) 1 else 0)
+            val ioctlMethod = Os::class.java.getMethod(
+                "ioctlInt",
+                FileDescriptor::class.java,
+                Int::class.javaPrimitiveType,
+                int32RefClass
+            )
+            ioctlMethod.invoke(null, fd, EVIOCGRAB, int32RefInstance)
         } catch (_: Exception) {
         }
     }
