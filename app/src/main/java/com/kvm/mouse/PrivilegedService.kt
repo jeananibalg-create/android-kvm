@@ -19,7 +19,7 @@ import java.nio.ByteOrder
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
-// ---- constantes do kernel (linux/input-event-codes.h e linux/uhid.h) ----
+// ---- Constantes do kernel Linux (input-event-codes.h e uhid.h) ----
 private const val EV_SYN = 0
 private const val EV_KEY = 1
 private const val EV_REL = 2
@@ -39,10 +39,10 @@ private const val UHID_OPEN = 4
 private const val UHID_CLOSE = 5
 private const val UHID_CREATE2 = 11
 private const val UHID_INPUT2 = 12
-private const val UHID_CREATE_SIZE = 4376 // 4 (tipo) + 4372 (struct uhid_create2_req)
+private const val UHID_CREATE_SIZE = 4376 // 4 (tipo) + 4372 (uhid_create2_req)
 private const val UHID_NAME = "Samsung Bluetooth Mouse KVM"
 
-// Mouse HID: 5 botões, X/Y 16 bits relativos, roda vertical e horizontal (AC Pan). Relatório de 7 bytes.
+// Descritor HID de mouse completo: 5 botões, X/Y 16-bit relativos, scroll vertical e horizontal (Pan).
 private val HID_DESC: ByteArray = intArrayOf(
     0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
     0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
@@ -65,21 +65,27 @@ private fun ByteBuffer.putFixed(s: String, len: Int) {
     position(start + len)
 }
 
-/** EVIOCGRAB: entrega o dispositivo só a quem o abriu; o Android (InputReader) deixa de receber eventos dele. */
+/** EVIOCGRAB (_IOW('E', 0x90, int)): captura exclusiva no kernel; o InputReader do Android deixa de receber eventos. */
 private object Evdev {
     private const val EVIOCGRAB = 0x40044590
     private val os: Any? = runCatching {
         Class.forName("libcore.io.Libcore").getField("os").get(null)
     }.getOrNull()
 
-    fun grab(fd: FileDescriptor): Boolean {
+    fun grab(fd: FileDescriptor, enable: Boolean = true): Boolean {
         val o = os ?: return false
-        return try {
-            o.javaClass.getMethod("ioctlInt", FileDescriptor::class.java, Int::class.javaPrimitiveType)
-                .invoke(o, fd, EVIOCGRAB)
+        val arg = if (enable) 1 else 0
+        // Tenta assinatura Android padrão (FileDescriptor, int, int) e fallback (FileDescriptor, int)
+        return runCatching {
+            o.javaClass.getMethod("ioctlInt", FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .invoke(o, fd, EVIOCGRAB, arg)
             true
-        } catch (_: Throwable) {
-            false
+        }.getOrElse {
+            runCatching {
+                o.javaClass.getMethod("ioctlInt", FileDescriptor::class.java, Int::class.javaPrimitiveType)
+                    .invoke(o, fd, EVIOCGRAB)
+                true
+            }.getOrDefault(false)
         }
     }
 }
@@ -99,7 +105,6 @@ private fun resolveInjector(): (InputEvent) -> Unit {
     throw IllegalStateException("InputManager indisponível", last)
 }
 
-/** Roda no processo do Shizuku (uid shell). Não tem acesso a Context. */
 class PrivilegedService : IPrivileged.Stub() {
 
     private val inject: (InputEvent) -> Unit by lazy { resolveInjector() }
@@ -123,7 +128,7 @@ class PrivilegedService : IPrivileged.Stub() {
     }
 
     // =====================================================================
-    // MESTRE: lê o mouse físico direto do kernel, prende (EVIOCGRAB) e envia por UDP
+    // MESTRE: captura exclusiva do mouse físico via evdev + envio UDP 8B
     // =====================================================================
 
     private class Session {
@@ -165,7 +170,7 @@ class PrivilegedService : IPrivileged.Stub() {
             } catch (_: Throwable) {
                 continue
             }
-            if (Evdev.grab(fd)) grabbed++
+            if (Evdev.grab(fd, true)) grabbed++
             opened++
             readers += thread(name = "kvm-evdev", isDaemon = true) { readLoop(fd, sess, s, addr, port) }
         }
@@ -180,7 +185,7 @@ class PrivilegedService : IPrivileged.Stub() {
 
     private fun stopLocked() {
         session?.alive = false
-        readers.forEach { runCatching { it.join(500) } }
+        readers.forEach { runCatching { it.join(300) } }
         readers.clear()
         session = null
         runCatching { sock?.close() }
@@ -188,7 +193,7 @@ class PrivilegedService : IPrivileged.Stub() {
         buttons = 0
     }
 
-    /** Nós /dev/input/eventN de dispositivos com REL_X e REL_Y (mouses). */
+    /** Localiza /dev/input/eventN com eixos relativos REL_X e REL_Y (bitmask 0x3), inclusive mouses BLE. */
     private fun findMouseNodes(): List<String> {
         val out = mutableListOf<String>()
         val text = try {
@@ -200,18 +205,18 @@ class PrivilegedService : IPrivileged.Stub() {
             val name = NAME_RE.find(block)?.groupValues?.get(1) ?: ""
             if (name == UHID_NAME) continue
             val handlers = HANDLERS_RE.find(block)?.groupValues?.get(1) ?: continue
-            if (!handlers.contains("mouse")) continue
             val event = EVENT_RE.find(handlers)?.groupValues?.get(1) ?: continue
-            val rel = REL_RE.find(block)?.groupValues?.get(1)?.trim()
-                ?.split(Regex("\\s+"))?.last()?.toLongOrNull(16) ?: continue
-            if ((rel and 3L) != 3L) continue
+            val relHex = REL_RE.find(block)?.groupValues?.get(1)?.trim()
+                ?.split(Regex("\\s+"))?.lastOrNull() ?: continue
+            val rel = relHex.toULongOrNull(16) ?: continue
+            if ((rel and 3UL) != 3UL) continue
             out += "/dev/input/event$event"
         }
         return out
     }
 
     private fun readLoop(fd: FileDescriptor, sess: Session, s: DatagramSocket, addr: InetAddress, port: Int) {
-        val evSize = if (Process.is64Bit()) 24 else 16 // struct input_event
+        val evSize = if (Process.is64Bit()) 24 else 16
         val buf = ByteArray(evSize * 64)
         val bb = ByteBuffer.wrap(buf).order(ByteOrder.nativeOrder())
         val pfd = arrayOf(StructPollfd().also {
@@ -225,7 +230,7 @@ class PrivilegedService : IPrivileged.Stub() {
         var changed = false
         try {
             while (sess.alive) {
-                if (Os.poll(pfd, 100) <= 0) continue
+                if (Os.poll(pfd, 50) <= 0) continue
                 val n = Os.read(fd, buf, 0, buf.size)
                 if (n <= 0) break
                 var off = 0
@@ -258,7 +263,6 @@ class PrivilegedService : IPrivileged.Stub() {
                         }
                         EV_SYN -> if (code == SYN_REPORT && (changed || dx != 0 || dy != 0 || wheel != 0 || pan != 0)) {
                             sendReport(s, addr, port, dx, dy, wheel, pan)
-                            // mudança de botão: repete só o estado (protege o "soltar" contra perda de pacote)
                             if (changed) sendReport(s, addr, port, 0, 0, 0, 0)
                             dx = 0
                             dy = 0
@@ -271,7 +275,8 @@ class PrivilegedService : IPrivileged.Stub() {
             }
         } catch (_: Throwable) {
         } finally {
-            runCatching { Os.close(fd) } // fechar libera a captura exclusiva
+            runCatching { Evdev.grab(fd, false) }
+            runCatching { Os.close(fd) }
         }
     }
 
@@ -290,7 +295,7 @@ class PrivilegedService : IPrivileged.Stub() {
     }
 
     // =====================================================================
-    // ESCRAVO: mouse Bluetooth HID virtual no kernel (/dev/uhid)
+    // ESCRAVO: mouse Bluetooth HID virtual via /dev/uhid
     // =====================================================================
 
     private class UhidDev(val fd: FileDescriptor) {
@@ -334,7 +339,6 @@ class PrivilegedService : IPrivileged.Stub() {
         return b.array()
     }
 
-    /** Lê os eventos do kernel. UHID_OPEN = o Android abriu o dispositivo (pronto para receber). */
     private fun drain(dev: UhidDev) {
         val buf = ByteArray(4400)
         val pfd = arrayOf(StructPollfd().also {
@@ -359,11 +363,11 @@ class PrivilegedService : IPrivileged.Stub() {
 
     private fun waitReady(dev: UhidDev) {
         var waited = 0
-        while (!dev.ready && dev.alive && waited < 1500) {
+        while (!dev.ready && dev.alive && waited < 1200) {
             Thread.sleep(5)
             waited += 5
         }
-        dev.ready = true // não espera de novo, mesmo se o aviso não chegar
+        dev.ready = true
     }
 
     private fun writeReport(dev: UhidDev, buttons: Int, dx: Int, dy: Int, wheel: Int, pan: Int) {
@@ -399,7 +403,6 @@ class PrivilegedService : IPrivileged.Stub() {
         } while (rx != 0 || ry != 0)
     }
 
-    /** Encosta o cursor na borda de entrada (slam) e depois desloca pela outra borda em passos curtos. */
     override fun mousePlace(slamX: Int, slamY: Int, moveX: Int, moveY: Int) {
         val dev = uhid ?: return
         waitReady(dev)
@@ -431,7 +434,7 @@ class PrivilegedService : IPrivileged.Stub() {
             Os.write(dev.fd, b.array(), 0, 4)
         } catch (_: Throwable) {
         }
-        dev.alive = false // a thread de leitura fecha o fd
+        dev.alive = false
     }
 
     override fun destroy() {

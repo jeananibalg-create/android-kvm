@@ -27,9 +27,8 @@ object KvmState {
     val running = MutableStateFlow(false)
     val shizuku = MutableStateFlow(false)
     val status = MutableStateFlow("")
-    val peers = MutableStateFlow<Map<String, PeerDevice>>(emptyMap())
-    val edges = MutableStateFlow<Map<Edge, PeerDevice>>(emptyMap())
+    val peers = MutableStateFlow>(emptyMap())
+    val edges = MutableStateFlow>(emptyMap())
 
-    /** Só dispara a travessia se o ponteiro já saiu da faixa da borda desde a última vez. */
     @Volatile var armed = true
 }

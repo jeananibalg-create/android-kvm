@@ -1,10 +1,10 @@
 package com.kvm.mouse;
 
-// Serviço que roda no processo do Shizuku (uid shell).
+// Serviço privilegiado executado no processo do Shizuku (uid shell).
 interface IPrivileged {
     // ---- Mestre ----
-    // Prende o mouse no kernel (EVIOCGRAB) e repassa os eventos por UDP direto ao escravo.
-    // Retorna 2 = repassando com captura exclusiva, 1 = repassando SEM captura, 0 = falhou.
+    // Prende o mouse físico no kernel (EVIOCGRAB) e envia pacotes UDP de 8 bytes direto ao escravo.
+    // Retorno: 2 = captura exclusiva ativa, 1 = repasse sem captura exclusiva, 0 = falha.
     int startRemote(String host, int port) = 1;
     oneway void stopRemote() = 2;
     oneway void wakeScreen() = 3;

@@ -71,10 +71,11 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.BLACK)
             setPadding(dp(20), dp(40), dp(20), dp(24))
         }
 
-        root.put(text("Android KVM 3.1", 24f), 0)
+        root.put(text("Android KVM 3.2", 24f), 0)
         ipText = text("", 14f, Color.rgb(102, 187, 106))
         root.put(ipText, 4)
         statusText = text("", 13f, Color.LTGRAY)
@@ -120,7 +121,10 @@ class MainActivity : Activity() {
         btnToggle.setTextColor(Color.WHITE)
         root.put(btnToggle, 20)
 
-        setContentView(ScrollView(this).apply { addView(root) })
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(Color.BLACK)
+            addView(root)
+        })
 
         scope.launch {
             combine(

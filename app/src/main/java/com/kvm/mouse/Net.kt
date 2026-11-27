@@ -10,20 +10,20 @@ import java.net.SocketAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 
-/** Protocolo binário sobre UDP. Todo pacote começa com 1 byte de tipo. */
+/** Protocolo binário sobre UDP. Byte 0 = tipo do pacote. */
 object Proto {
-    const val REPORT: Byte = 1 // Mestre -> Escravo: u8 botões, i16 dx, i16 dy, i8 roda, i8 pan
-    const val ENTER: Byte = 2  // Mestre -> Escravo: u8 borda, f32 razão, i32 sessão
-    const val ACK: Byte = 3    // Escravo -> Mestre: i32 sessão
-    const val LEAVE: Byte = 4  // Mestre -> Escravo
-    const val RETURN: Byte = 5 // Escravo -> Mestre
-    const val PING: Byte = 6   // Escravo -> Mestre (keep-alive enquanto ativo)
-    const val HELLO: Byte = 7  // Escravo -> broadcast: nome do modelo (UTF-8)
+    const val REPORT: Byte = 1 // Mestre -> Escravo (8B): u8 botões, i16 dx, i16 dy, i8 wheel, i8 pan
+    const val ENTER: Byte = 2  // Mestre -> Escravo (10B): u8 borda, f32 razão, i32 sessão
+    const val ACK: Byte = 3    // Escravo -> Mestre (5B): i32 sessão
+    const val LEAVE: Byte = 4  // Mestre -> Escravo (1B)
+    const val RETURN: Byte = 5 // Escravo -> Mestre (1B)
+    const val PING: Byte = 6   // Escravo -> Mestre (1B)
+    const val HELLO: Byte = 7  // Escravo -> Broadcast: nome do modelo UTF-8
 }
 
 object Net {
     private val tx = Executors.newSingleThreadExecutor { r -> Thread(r, "kvm-tx").apply { isDaemon = true } }
-    private val broadcastAddr: InetAddress by lazy { InetAddress.getByName("255.255.255.255") }
+    private val globalBroadcast: InetAddress by lazy { InetAddress.getByName("255.255.255.255") }
 
     @Volatile private var socket: DatagramSocket? = null
 
@@ -60,7 +60,6 @@ object Net {
         return b.array()
     }
 
-    // Pacotes de controle são idempotentes: enviados em cópias para sobreviver a perdas.
     fun enter(host: InetAddress, edge: Edge, ratio: Float, session: Int) =
         post(host, frame(Proto.ENTER, 9) { put(edge.ordinal.toByte()); putFloat(ratio); putInt(session) }, 3)
 
@@ -71,8 +70,18 @@ object Net {
 
     fun hello(model: String) {
         val name = model.toByteArray(Charsets.UTF_8)
-        post(broadcastAddr, frame(Proto.HELLO, name.size) { put(name) })
+        val payload = frame(Proto.HELLO, name.size) { put(name) }
+        val targets = subnetBroadcasts() + globalBroadcast
+        targets.distinct().forEach { addr -> post(addr, payload) }
     }
+
+    private fun subnetBroadcasts(): List<InetAddress> = runCatching {
+        NetworkInterface.getNetworkInterfaces().asSequence()
+            .filter { it.isUp && !it.isLoopback }
+            .flatMap { it.interfaceAddresses.asSequence() }
+            .mapNotNull { it.broadcast }
+            .toList()
+    }.getOrDefault(emptyList())
 
     fun localIp(): String = runCatching {
         NetworkInterface.getNetworkInterfaces().asSequence()

@@ -48,7 +48,8 @@ class KvmService : Service() {
     companion object {
         const val ACTION_ABORT = "com.kvm.mouse.ABORT"
         private const val CHANNEL = "kvm"
-        private const val EXIT_PUSH = 30f // empurrão (em unidades do mouse) contra a borda para voltar ao Mestre
+        private const val EXIT_PUSH = 35f
+        private const val ACCEL_FACTOR = 1.35f // compensa aceleração do ponteiro no Android
     }
 
     private val isMaster = KvmState.isMaster.value
@@ -86,7 +87,7 @@ class KvmService : Service() {
     // ---- Shizuku ----
     private val userServiceArgs by lazy {
         Shizuku.UserServiceArgs(ComponentName(packageName, PrivilegedService::class.java.name))
-            .daemon(false).processNameSuffix("kvm").debuggable(false).version(31)
+            .daemon(false).processNameSuffix("kvm").debuggable(false).version(32)
     }
 
     private val connection = object : ServiceConnection {
@@ -108,20 +109,11 @@ class KvmService : Service() {
     }
 
     private val displayListener = object : DisplayManager.DisplayListener {
-        override fun onDisplayAdded(displayId: Int) {
-            onDisplaysChanged()
-        }
-
-        override fun onDisplayRemoved(displayId: Int) {
-            onDisplaysChanged()
-        }
-
-        override fun onDisplayChanged(displayId: Int) {
-            onDisplaysChanged()
-        }
+        override fun onDisplayAdded(displayId: Int) = onDisplaysChanged()
+        override fun onDisplayRemoved(displayId: Int) = onDisplaysChanged()
+        override fun onDisplayChanged(displayId: Int) = onDisplaysChanged()
     }
 
-    // Fallback (só se a captura exclusiva falhar): volta a apagar a tela se o mouse a acender.
     private val screenOn = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (remoteActive && !grabbed) runCatching { priv?.sleepScreen() }
@@ -207,8 +199,6 @@ class KvmService : Service() {
         }
         super.onDestroy()
     }
-
-    // ------------------------------------------------------------------ infraestrutura
 
     private fun startInForeground() {
         getSystemService(NotificationManager::class.java)
@@ -325,7 +315,7 @@ class KvmService : Service() {
         for ((edge, peer) in KvmState.edges.value) {
             val horizontal = edge == Edge.LEFT || edge == Edge.RIGHT
             val v = View(this)
-            v.pointerIcon = hidden // seta do Mestre invisível enquanto está parada na borda
+            v.pointerIcon = hidden
             v.setOnHoverListener { _, ev ->
                 when (ev.actionMasked) {
                     MotionEvent.ACTION_HOVER_EXIT -> KvmState.armed = true
@@ -371,7 +361,6 @@ class KvmService : Service() {
         remoteActive = false
         pendingSession = SystemClock.elapsedRealtime().toInt() or 1
         Net.enter(peer.host, edge, ratio, pendingSession)
-        // Se o escravo não confirmar, o mouse nunca é preso.
         ui.launch {
             delay(900)
             if (remotePeer === peer && !remoteActive) abortRemote("Escravo não respondeu")
@@ -403,7 +392,6 @@ class KvmService : Service() {
         }
     }
 
-    /** O escravo devolveu a seta: solta o mouse e acende a tela do Mestre. */
     private fun finishRemote() {
         if (remotePeer == null) return
         remotePeer = null
@@ -456,10 +444,10 @@ class KvmService : Service() {
         val w = spanW
         val h = spanH
         val (sx, sy, mx, my) = when (e) {
-            Edge.LEFT -> listOf(-1, -1, 0, (ratio * h).toInt())
-            Edge.RIGHT -> listOf(1, -1, 0, (ratio * h).toInt())
-            Edge.TOP -> listOf(-1, -1, (ratio * w).toInt(), 0)
-            Edge.BOTTOM -> listOf(-1, 1, (ratio * w).toInt(), 0)
+            Edge.LEFT -> listOf(-1, -1, 0, (ratio * h / ACCEL_FACTOR).toInt())
+            Edge.RIGHT -> listOf(1, -1, 0, (ratio * h / ACCEL_FACTOR).toInt())
+            Edge.TOP -> listOf(-1, -1, (ratio * w / ACCEL_FACTOR).toInt(), 0)
+            Edge.BOTTOM -> listOf(-1, 1, (ratio * w / ACCEL_FACTOR).toInt(), 0)
         }
         when (e) {
             Edge.LEFT -> { px = 0f; py = ratio * h }
@@ -485,9 +473,8 @@ class KvmService : Service() {
         val pan = b.get().toInt()
         val e = entry ?: return
 
-        // Estimativa da posição (o Android aplica aceleração, então é aproximada)
-        val nx = px + dx
-        val ny = py + dy
+        val nx = px + (dx * ACCEL_FACTOR)
+        val ny = py + (dy * ACCEL_FACTOR)
         val beyond = when (e) {
             Edge.LEFT -> -nx
             Edge.RIGHT -> nx - spanW
@@ -513,7 +500,6 @@ class KvmService : Service() {
         if (m != null) Net.ret(m)
     }
 
-    /** Solta botões e destrói o mouse virtual (o cursor nativo some na hora). */
     private fun deactivate() {
         if (!active) return
         active = false
