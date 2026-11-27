@@ -49,7 +49,7 @@ class KvmService : Service() {
         const val ACTION_ABORT = "com.kvm.mouse.ABORT"
         private const val CHANNEL = "kvm"
         private const val EXIT_PUSH = 35f
-        private const val ACCEL_FACTOR = 1.35f // compensa aceleração do ponteiro no Android
+        private const val ACCEL_FACTOR = 1.35f
     }
 
     private val isMaster = KvmState.isMaster.value
@@ -84,10 +84,9 @@ class KvmService : Service() {
     @Volatile private var spanW = 1080f
     @Volatile private var spanH = 2400f
 
-    // ---- Shizuku ----
     private val userServiceArgs by lazy {
         Shizuku.UserServiceArgs(ComponentName(packageName, PrivilegedService::class.java.name))
-            .daemon(false).processNameSuffix("kvm").debuggable(false).version(32)
+            .daemon(false).processNameSuffix("kvm").debuggable(false).version(33)
     }
 
     private val connection = object : ServiceConnection {
@@ -250,7 +249,6 @@ class KvmService : Service() {
         screenW = b.width()
         screenH = b.height()
 
-        // Escravo: soma das larguras das telas ativas (celular + monitor DeX)
         val dm = getSystemService(DisplayManager::class.java)
         val list = dm.displays.filter { it.state == Display.STATE_ON }.ifEmpty { dm.displays.toList() }
         var w = 0

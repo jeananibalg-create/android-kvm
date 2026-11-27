@@ -19,7 +19,6 @@ import java.nio.ByteOrder
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
-// ---- Constantes do kernel Linux (input-event-codes.h e uhid.h) ----
 private const val EV_SYN = 0
 private const val EV_KEY = 1
 private const val EV_REL = 2
@@ -39,10 +38,9 @@ private const val UHID_OPEN = 4
 private const val UHID_CLOSE = 5
 private const val UHID_CREATE2 = 11
 private const val UHID_INPUT2 = 12
-private const val UHID_CREATE_SIZE = 4376 // 4 (tipo) + 4372 (uhid_create2_req)
+private const val UHID_CREATE_SIZE = 4376
 private const val UHID_NAME = "Samsung Bluetooth Mouse KVM"
 
-// Descritor HID de mouse completo: 5 botões, X/Y 16-bit relativos, scroll vertical e horizontal (Pan).
 private val HID_DESC: ByteArray = intArrayOf(
     0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
     0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
@@ -65,7 +63,6 @@ private fun ByteBuffer.putFixed(s: String, len: Int) {
     position(start + len)
 }
 
-/** EVIOCGRAB (_IOW('E', 0x90, int)): captura exclusiva no kernel; o InputReader do Android deixa de receber eventos. */
 private object Evdev {
     private const val EVIOCGRAB = 0x40044590
     private val os: Any? = runCatching {
@@ -75,7 +72,6 @@ private object Evdev {
     fun grab(fd: FileDescriptor, enable: Boolean = true): Boolean {
         val o = os ?: return false
         val arg = if (enable) 1 else 0
-        // Tenta assinatura Android padrão (FileDescriptor, int, int) e fallback (FileDescriptor, int)
         return runCatching {
             o.javaClass.getMethod("ioctlInt", FileDescriptor::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                 .invoke(o, fd, EVIOCGRAB, arg)
@@ -128,7 +124,7 @@ class PrivilegedService : IPrivileged.Stub() {
     }
 
     // =====================================================================
-    // MESTRE: captura exclusiva do mouse físico via evdev + envio UDP 8B
+    // MESTRE: captura evdev via Kernel + repasse UDP
     // =====================================================================
 
     private class Session {
@@ -193,7 +189,6 @@ class PrivilegedService : IPrivileged.Stub() {
         buttons = 0
     }
 
-    /** Localiza /dev/input/eventN com eixos relativos REL_X e REL_Y (bitmask 0x3), inclusive mouses BLE. */
     private fun findMouseNodes(): List<String> {
         val out = mutableListOf<String>()
         val text = try {
@@ -208,8 +203,19 @@ class PrivilegedService : IPrivileged.Stub() {
             val event = EVENT_RE.find(handlers)?.groupValues?.get(1) ?: continue
             val relHex = REL_RE.find(block)?.groupValues?.get(1)?.trim()
                 ?.split(Regex("\\s+"))?.lastOrNull() ?: continue
-            val rel = relHex.toULongOrNull(16) ?: continue
-            if ((rel and 3UL) != 3UL) continue
+            
+            // Corrige de ULong para Long com tratamento de segurança contra erros de overflow
+            val rel = try {
+                if (relHex.startsWith("0x", true)) {
+                    java.lang.Long.parseLong(relHex.substring(2), 16)
+                } else {
+                    java.lang.Long.parseLong(relHex, 16)
+                }
+            } catch (_: Exception) {
+                0L
+            }
+            
+            if ((rel and 3L) != 3L) continue
             out += "/dev/input/event$event"
         }
         return out
@@ -295,7 +301,7 @@ class PrivilegedService : IPrivileged.Stub() {
     }
 
     // =====================================================================
-    // ESCRAVO: mouse Bluetooth HID virtual via /dev/uhid
+    // ESCRAVO: uhid virtual Bluetooth
     // =====================================================================
 
     private class UhidDev(val fd: FileDescriptor) {
@@ -330,8 +336,8 @@ class PrivilegedService : IPrivileged.Stub() {
         b.putFixed("kvm/uhid", 64)
         b.putFixed("kvm-uhid-0", 64)
         b.putShort(HID_DESC.size.toShort())
-        b.putShort(0x05) // BUS_BLUETOOTH
-        b.putInt(0x04E8) // Samsung
+        b.putShort(0x05)
+        b.putInt(0x04E8)
         b.putInt(0x7021)
         b.putInt(0x0100)
         b.putInt(0)

@@ -75,7 +75,7 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(40), dp(20), dp(24))
         }
 
-        root.put(text("Android KVM 3.2", 24f), 0)
+        root.put(text("Android KVM 3.3", 24f), 0)
         ipText = text("", 14f, Color.rgb(102, 187, 106))
         root.put(ipText, 4)
         statusText = text("", 13f, Color.LTGRAY)

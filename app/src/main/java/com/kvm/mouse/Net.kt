@@ -10,15 +10,14 @@ import java.net.SocketAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 
-/** Protocolo binário sobre UDP. Byte 0 = tipo do pacote. */
 object Proto {
-    const val REPORT: Byte = 1 // Mestre -> Escravo (8B): u8 botões, i16 dx, i16 dy, i8 wheel, i8 pan
-    const val ENTER: Byte = 2  // Mestre -> Escravo (10B): u8 borda, f32 razão, i32 sessão
-    const val ACK: Byte = 3    // Escravo -> Mestre (5B): i32 sessão
-    const val LEAVE: Byte = 4  // Mestre -> Escravo (1B)
-    const val RETURN: Byte = 5 // Escravo -> Mestre (1B)
-    const val PING: Byte = 6   // Escravo -> Mestre (1B)
-    const val HELLO: Byte = 7  // Escravo -> Broadcast: nome do modelo UTF-8
+    const val REPORT: Byte = 1
+    const val ENTER: Byte = 2
+    const val ACK: Byte = 3
+    const val LEAVE: Byte = 4
+    const val RETURN: Byte = 5
+    const val PING: Byte = 6
+    const val HELLO: Byte = 7
 }
 
 object Net {
@@ -31,7 +30,7 @@ object Net {
         val s = DatagramSocket(null as SocketAddress?)
         s.reuseAddress = true
         s.broadcast = true
-        runCatching { s.trafficClass = 0x10 } // IPTOS_LOWDELAY
+        runCatching { s.trafficClass = 0x10 }
         s.bind(InetSocketAddress(KvmState.PORT))
         socket = s
         return s
