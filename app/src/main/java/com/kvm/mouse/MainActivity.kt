@@ -20,7 +20,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
-import rikka.shizuku.ShizukuProvider
 import java.net.InetAddress
 import kotlin.concurrent.thread
 
@@ -37,7 +36,7 @@ class MainActivity : AppCompatActivity() {
                 if (grantResult == PackageManager.PERMISSION_GRANTED) {
                     Toast.makeText(this, "Shizuku AUTORIZADO com sucesso!", Toast.LENGTH_SHORT).show()
                 } else {
-                    Toast.makeText(this, "Permissão do Shizuku NEGADA. Autorize dentro do app Shizuku.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Permissão do Shizuku NEGADA.", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -55,10 +54,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         KvmState.loadConfig(this)
 
-        ShizukuProvider.enableMultiProcessSupport(false)
-        Shizuku.addRequestPermissionResultListener(shizukuPermListener)
-        Shizuku.addBinderReceivedListenerSticky(shizukuBinderReceivedListener)
-        Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
+        try {
+            Shizuku.addRequestPermissionResultListener(shizukuPermListener)
+            Shizuku.addBinderReceivedListenerSticky(shizukuBinderReceivedListener)
+            Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
+        } catch (_: Exception) {
+        }
 
         val scroll = ScrollView(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -72,7 +73,7 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(root)
 
         val title = TextView(this).apply {
-            text = "Android KVM v5.2 (Multi Control)"
+            text = "Android KVM v5.3 (Multi Control)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -259,9 +260,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        Shizuku.removeRequestPermissionResultListener(shizukuPermListener)
-        Shizuku.removeBinderReceivedListener(shizukuBinderReceivedListener)
-        Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
+        try {
+            Shizuku.removeRequestPermissionResultListener(shizukuPermListener)
+            Shizuku.removeBinderReceivedListener(shizukuBinderReceivedListener)
+            Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
+        } catch (_: Exception) {
+        }
         super.onDestroy()
     }
 

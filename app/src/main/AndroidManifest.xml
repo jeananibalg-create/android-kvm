@@ -19,7 +19,6 @@
     <application
         android:allowBackup="true"
         android:label="Android KVM"
-        android:persistent="true"
         android:theme="@style/Theme.KVM">
 
         <activity
