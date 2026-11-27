@@ -59,7 +59,6 @@ class KvmService : Service() {
     private var entryEdge: Edge? = null
     private var masterAddress: InetAddress? = null
     private var lastSlaveTrafficMs = 0L
-    private var remoteSessionStartMs = 0L
 
     private var injector: IInputInjector? = null
     private var udpSocket: DatagramSocket? = null
@@ -71,38 +70,18 @@ class KvmService : Service() {
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(14)
+    ).daemon(false).processNameSuffix("kvm_injector").debuggable(false).version(15)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
-                    if (KvmState.isMasterMode) {
-                        if (KvmState.allowLockscreenControl || KvmState.isRemoteActive) {
-                            acquireCpuOnlyWakeLock()
-                        }
-                        if (KvmState.isRemoteActive) {
-                            // Garante que o mouse fica exclusivamente preso no Shizuku enquanto a tela esta apagada
-                            try { injector?.setExclusiveMouseGrab(true) } catch (_: Exception) {}
-                        }
+                    if (KvmState.isMasterMode && (KvmState.allowLockscreenControl || KvmState.isRemoteActive)) {
+                        acquireCpuOnlyWakeLock()
                     }
                 }
-                Intent.ACTION_SCREEN_ON -> {
-                    if (KvmState.isMasterMode && KvmState.isRemoteActive) {
-                        if (KvmState.turnOffMasterScreenOnRemote) {
-                            // Se o Android tentou acordar a tela do Mestre durante controle remoto, apaga de novo
-                            mainHandler.postDelayed({
-                                if (KvmState.isRemoteActive && KvmState.turnOffMasterScreenOnRemote) {
-                                    try { injector?.setScreenPower(false) } catch (_: Exception) {}
-                                }
-                            }, 60)
-                        } else if (KvmState.captureActivity == null && KvmState.allowLockscreenControl) {
-                            launchMultiControlCapture()
-                        }
-                    }
-                }
-                Intent.ACTION_USER_PRESENT -> {
-                    if (KvmState.isMasterMode && KvmState.isRemoteActive && !KvmState.turnOffMasterScreenOnRemote && KvmState.captureActivity == null) {
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    if (KvmState.isMasterMode && KvmState.isRemoteActive && KvmState.captureActivity == null) {
                         launchMultiControlCapture()
                     }
                 }
@@ -125,36 +104,20 @@ class KvmService : Service() {
         KvmState.activeEdge = edge
         KvmState.activePeer = peer
         KvmState.isRemoteActive = true
-        remoteSessionStartMs = SystemClock.elapsedRealtime()
-        KvmState.lastHeartbeatMs = remoteSessionStartMs
+        KvmState.lastHeartbeatMs = SystemClock.elapsedRealtime()
 
         acquireCpuOnlyWakeLock()
         HybridTransport.sendEnter(peer, edge, normRatio)
 
-        // Sequestra o mouse Bluetooth via EVIOCGRAB no Shizuku:
-        // impede o sistema Android do Mestre de acordar com movimentos/cliques enquanto o cursor esta no Escravo
-        try { injector?.setExclusiveMouseGrab(true) } catch (_: Exception) {}
-
-        if (KvmState.turnOffMasterScreenOnRemote) {
-            KvmState.captureActivity?.releaseAndClose()
-            // Mantem isRemoteActive = true pois releaseAndClose zera o estado
-            KvmState.activeEdge = edge
-            KvmState.activePeer = peer
-            KvmState.isRemoteActive = true
-
-            if (powerManager.isInteractive) {
-                mainHandler.postDelayed({
-                    if (KvmState.isRemoteActive && KvmState.turnOffMasterScreenOnRemote) {
-                        try { injector?.setScreenPower(false) } catch (_: Exception) {}
-                    }
-                }, 80)
-            }
-        } else if (powerManager.isInteractive) {
-            launchMultiControlCapture()
+        // Sempre abre PointerCaptureActivity quando a tela esta acesa:
+        // Se turnOffMasterScreenOnRemote = true, ela exibe cortina AMOLED #000000 com brilho minimo
+        // e absorve 100% dos cliques/movimentos sem bloquear o sistema nem piscar a tela
+        if (powerManager.isInteractive) {
+            mainHandler.post { launchMultiControlCapture() }
         }
     }
 
-    private fun exitRemoteSession(wakeMasterScreen: Boolean) {
+    private fun exitRemoteSession() {
         val (w, h) = getFullScreenBounds()
         when (KvmState.activeEdge) {
             Edge.RIGHT -> virtualMasterX = w - 40f
@@ -167,15 +130,7 @@ class KvmService : Service() {
         KvmState.activePeer = null
         KvmState.activeEdge = null
         releaseCpuWakeLock()
-
-        // Devolve o mouse Bluetooth ao sistema operacional do Mestre
-        try { injector?.setExclusiveMouseGrab(false) } catch (_: Exception) {}
-
         KvmState.captureActivity?.releaseAndClose()
-
-        if (wakeMasterScreen && !powerManager.isInteractive) {
-            try { injector?.setScreenPower(true) } catch (_: Exception) {}
-        }
     }
 
     private fun acquireCpuOnlyWakeLock() {
@@ -203,13 +158,13 @@ class KvmService : Service() {
         return !powerManager.isInteractive || keyguardManager.isKeyguardLocked
     }
 
+    // Fallback de leitura bruta /dev/input/eventX: atua SOMENTE quando a tela do Mestre ja estava apagada
+    // ou quando PointerCaptureActivity nao esta ativa, evitando duplicacao de eventos
     private val hwCallback = object : IMouseEventCallback.Stub() {
         override fun onMouseDelta(dx: Float, dy: Float) {
             if (!KvmState.isMasterMode) return
-            if (isScreenOffOrLocked() && !KvmState.allowLockscreenControl && !KvmState.isRemoteActive) return
-
-            // Se PointerCaptureActivity esta ativa e com foco (quando apagar tela estiver desligado), ela envia sem duplicar
-            if (KvmState.captureActivity != null && powerManager.isInteractive && !KvmState.turnOffMasterScreenOnRemote) return
+            if (isScreenOffOrLocked() && !KvmState.allowLockscreenControl) return
+            if (KvmState.captureActivity != null && powerManager.isInteractive) return
 
             val (w, h) = getFullScreenBounds()
             if (!KvmState.isRemoteActive) {
@@ -239,14 +194,14 @@ class KvmService : Service() {
 
         override fun onMouseButton(action: Int, button: Int) {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
-            if (KvmState.captureActivity != null && powerManager.isInteractive && !KvmState.turnOffMasterScreenOnRemote) return
+            if (KvmState.captureActivity != null && powerManager.isInteractive) return
             val peer = KvmState.activePeer ?: return
             HybridTransport.sendButton(peer, action, button)
         }
 
         override fun onMouseScroll(vScroll: Float) {
             if (!KvmState.isMasterMode || !KvmState.isRemoteActive) return
-            if (KvmState.captureActivity != null && powerManager.isInteractive && !KvmState.turnOffMasterScreenOnRemote) return
+            if (KvmState.captureActivity != null && powerManager.isInteractive) return
             val peer = KvmState.activePeer ?: return
             HybridTransport.sendScroll(peer, vScroll, 0f)
         }
@@ -262,7 +217,6 @@ class KvmService : Service() {
             if (KvmState.isMasterMode) {
                 try {
                     injector?.startHardwareMouseMonitor(hwCallback)
-                    injector?.setExclusiveMouseGrab(KvmState.isRemoteActive)
                 } catch (_: Exception) {}
             } else {
                 try { injector?.createVirtualMouse() } catch (_: Exception) {}
@@ -364,12 +318,8 @@ class KvmService : Service() {
                         if (peer != null) {
                             HybridTransport.sendPing(peer)
                         }
-                        // Garante que a tela do Mestre permaneca apagada enquanto o cursor estiver no Escravo
-                        if (KvmState.turnOffMasterScreenOnRemote && powerManager.isInteractive && (now - remoteSessionStartMs) > 250L) {
-                            try { injector?.setScreenPower(false) } catch (_: Exception) {}
-                        }
                         if (KvmState.lastHeartbeatMs > 0L && (now - KvmState.lastHeartbeatMs) > 2500L) {
-                            exitRemoteSession(wakeMasterScreen = true)
+                            exitRemoteSession()
                         }
                     } else if (!KvmState.isMasterMode) {
                         if (lastSlaveTrafficMs > 0L && (now - lastSlaveTrafficMs) > 2800L) {
@@ -379,7 +329,7 @@ class KvmService : Service() {
                     }
                 } catch (_: Exception) {
                 }
-                Thread.sleep(450)
+                Thread.sleep(500)
             }
         }
     }
@@ -422,7 +372,7 @@ class KvmService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Android KVM v5.1")
+            .setContentTitle("Android KVM v5.5")
             .setContentText(if (KvmState.isMasterMode) "Mestre (${getLocalIpAddress()})" else "Escravo (${getLocalIpAddress()})")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setOngoing(true)
@@ -726,7 +676,7 @@ class KvmService : Service() {
             }
             KvmState.PKT_RETURN -> {
                 if (!KvmState.isRemoteActive) return
-                exitRemoteSession(wakeMasterScreen = true)
+                exitRemoteSession()
             }
         }
     }

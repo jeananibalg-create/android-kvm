@@ -2,6 +2,7 @@ package com.kvm.mouse
 
 import android.app.Activity
 import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -9,6 +10,8 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PointerIcon
 import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.FrameLayout
 
@@ -26,19 +29,24 @@ class PointerCaptureActivity : Activity() {
         setShowWhenLocked(KvmState.allowLockscreenControl)
         setTurnScreenOn(false)
 
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
         window.addFlags(
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         )
         window.attributes = window.attributes.apply {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            if (KvmState.turnOffMasterScreenOnRemote) {
+                screenBrightness = 0.004f
+            }
         }
-        window.setDimAmount(0f)
+
+        val blackoutActive = KvmState.turnOffMasterScreenOnRemote
 
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(1, 0, 0, 0))
+            // Preto puro AMOLED (#000000) apaga os pixels do painel sem bloquear o Android nem gerar toques fantasmas
+            setBackgroundColor(if (blackoutActive) Color.BLACK else Color.argb(1, 0, 0, 0))
             pointerIcon = PointerIcon.getSystemIcon(this@PointerCaptureActivity, PointerIcon.TYPE_NULL)
         }
 
@@ -50,13 +58,24 @@ class PointerCaptureActivity : Activity() {
         }.apply {
             isFocusable = true
             isFocusableInTouchMode = true
+            setBackgroundColor(if (blackoutActive) Color.BLACK else Color.TRANSPARENT)
             pointerIcon = PointerIcon.getSystemIcon(this@PointerCaptureActivity, PointerIcon.TYPE_NULL)
         }
 
         root.addView(captureView, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
+        hideSystemBars()
         captureView.requestFocus()
         ensurePointerCapture()
+    }
+
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.let { controller ->
+                controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        }
     }
 
     private fun ensurePointerCapture() {
@@ -64,7 +83,7 @@ class PointerCaptureActivity : Activity() {
             if (!isFinishing) {
                 captureView.requestFocus()
                 captureView.requestPointerCapture()
-                if (!captureView.hasPointerCapture() && retryCount < 30) {
+                if (!captureView.hasPointerCapture() && retryCount < 40) {
                     retryCount++
                     ensurePointerCapture()
                 }
@@ -75,6 +94,7 @@ class PointerCaptureActivity : Activity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
+            hideSystemBars()
             captureView.requestFocus()
             captureView.requestPointerCapture()
         }
