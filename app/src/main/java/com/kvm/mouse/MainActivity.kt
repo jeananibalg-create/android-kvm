@@ -1,11 +1,14 @@
 package com.kvm.mouse
 
 import android.app.AlertDialog
+import android.content.ComponentName
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
@@ -28,15 +31,38 @@ class MainActivity : AppCompatActivity() {
     private lateinit var shizukuStatusText: TextView
     private lateinit var btnShizuku: Button
     private val edgeButtons = mutableMapOf<Edge, Button>()
+    @Volatile private var realShizukuServiceVerified = false
+
+    private val testServiceArgs = Shizuku.UserServiceArgs(
+        ComponentName("com.kvm.mouse", InputInjectorService::class.java.name)
+    ).daemon(false).processNameSuffix("kvm_verify").debuggable(false).version(14)
+
+    private val testConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            realShizukuServiceVerified = true
+            runOnUiThread {
+                shizukuStatusText.text = "Shizuku: CONECTADO E TESTADO COM SUCESSO!"
+                shizukuStatusText.setTextColor(Color.GREEN)
+                btnShizuku.text = "1. Shizuku Verificado (OK)"
+            }
+            try {
+                Shizuku.unbindUserService(testServiceArgs, this, true)
+            } catch (_: Exception) {
+            }
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {}
+    }
 
     private val shizukuPermListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
         if (requestCode == 1001) {
             runOnUiThread {
-                updateShizukuStatus()
                 if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                    Toast.makeText(this, "Shizuku AUTORIZADO com sucesso!", Toast.LENGTH_SHORT).show()
+                    verifyRealShizukuBinding()
+                    Toast.makeText(this, "Permissão concedida no Shizuku!", Toast.LENGTH_SHORT).show()
                 } else {
-                    Toast.makeText(this, "Permissão do Shizuku NEGADA.", Toast.LENGTH_LONG).show()
+                    realShizukuServiceVerified = false
+                    shizukuStatusText.text = "Shizuku: NEGADO pelo usuário"
+                    shizukuStatusText.setTextColor(Color.RED)
                 }
             }
         }
@@ -47,6 +73,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val shizukuBinderDeadListener = Shizuku.OnBinderDeadListener {
+        realShizukuServiceVerified = false
         runOnUiThread { updateShizukuStatus() }
     }
 
@@ -73,7 +100,7 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(root)
 
         val title = TextView(this).apply {
-            text = "Android KVM v5.3 (Multi Control)"
+            text = "Android KVM v5.4 (Multi Control)"
             textSize = 22f
             setTextColor(Color.WHITE)
         }
@@ -175,7 +202,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(speedBar)
 
         btnShizuku = Button(this).apply {
-            text = "1. Autorizar Shizuku (Obrigatório em ambos)"
+            text = "1. Autorizar / Testar Shizuku"
             setOnClickListener { requestShizukuPerm() }
         }
         root.addView(btnShizuku)
@@ -269,26 +296,31 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private fun verifyRealShizukuBinding() {
+        try {
+            Shizuku.bindUserService(testServiceArgs, testConnection)
+        } catch (e: Exception) {
+            realShizukuServiceVerified = false
+            shizukuStatusText.text = "Shizuku: Falha no bind (${e.message})"
+            shizukuStatusText.setTextColor(Color.RED)
+        }
+    }
+
     private fun updateShizukuStatus() {
         try {
             if (!Shizuku.pingBinder()) {
+                realShizukuServiceVerified = false
                 shizukuStatusText.text = "Shizuku: PARADO (Inicie o serviço no app Shizuku)"
                 shizukuStatusText.setTextColor(Color.RED)
-                btnShizuku.text = "1. Shizuku Parado — Abra o Shizuku primeiro"
-                return
-            }
-            if (Shizuku.isPreV11()) {
-                shizukuStatusText.text = "Shizuku: Versão antiga não suportada"
-                shizukuStatusText.setTextColor(Color.RED)
+                btnShizuku.text = "1. Shizuku Parado — Abrir Shizuku"
                 return
             }
             val granted = Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
             if (granted) {
-                shizukuStatusText.text = "Shizuku: CONECTADO E AUTORIZADO (UID ${Shizuku.getUid()})"
-                shizukuStatusText.setTextColor(Color.GREEN)
-                btnShizuku.text = "1. Shizuku Autorizado (OK)"
+                verifyRealShizukuBinding()
             } else {
-                shizukuStatusText.text = "Shizuku: AGUARDANDO AUTORIZAÇÃO (Toque no botão 1)"
+                realShizukuServiceVerified = false
+                shizukuStatusText.text = "Shizuku: NÃO AUTORIZADO (Toque no botão 1)"
                 shizukuStatusText.setTextColor(Color.YELLOW)
                 btnShizuku.text = "1. Autorizar Shizuku AGORA"
             }
@@ -367,11 +399,12 @@ class MainActivity : AppCompatActivity() {
                 }
                 return
             }
-            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            // Mesmo se checkSelfPermission retornar true em cache, força requestPermission se o bind real falhou
+            if (!realShizukuServiceVerified || Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
                 Shizuku.requestPermission(1001)
+                verifyRealShizukuBinding()
             } else {
-                updateShizukuStatus()
-                Toast.makeText(this, "Shizuku já está autorizado!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Shizuku verificado e funcionando!", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
             Toast.makeText(this, "Erro Shizuku: ${e.message}", Toast.LENGTH_LONG).show()
